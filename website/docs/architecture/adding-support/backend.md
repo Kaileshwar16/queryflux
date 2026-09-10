@@ -118,9 +118,9 @@ Until the adapter exists, your `EngineConfig` variant may **`bail!("Engine <name
 
 ## QueryFlux Studio (optional but typical)
 
-Studio lives in the separate **[queryflux-console](https://github.com/lakeops-org/queryflux-console)** repository (Next.js). It talks to the Admin API; it does **not** embed Rust. Today, **Rust `descriptor()` and the TypeScript `descriptor` must match by hand** (same `engineKey`, field keys, auth). The proxy also serves **`GET /admin/engine-registry`**.
+Studio lives in the separate **[queryflux-studio](https://github.com/lakeops-org/queryflux-studio)** repository (Next.js). It talks to the Admin API; it does **not** embed Rust. Today, **Rust `descriptor()` and the TypeScript `descriptor` must match by hand** (same `engineKey`, field keys, auth). The proxy also serves **`GET /admin/engine-registry`**.
 
-Paths in this section are relative to the `queryflux-console` repository.
+Paths in this section are relative to the `queryflux-studio` repository.
 
 **Minimum Studio work**
 

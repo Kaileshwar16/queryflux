@@ -142,7 +142,7 @@ queryflux/
 └── Makefile                        # build / run / test shortcuts
 ```
 
-QueryFlux Studio is maintained separately in the [queryflux-console](https://github.com/lakeops-org/queryflux-console) repository.
+QueryFlux Studio is maintained separately in the [queryflux-studio](https://github.com/lakeops-org/queryflux-studio) repository.
 
 ---
 

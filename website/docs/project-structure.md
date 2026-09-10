@@ -64,7 +64,7 @@ Authoritative workspace membership is **`Cargo.toml`** `[workspace] members`.
 
 | Path | Purpose |
 | --- | --- |
-| [queryflux-console](https://github.com/lakeops-org/queryflux-console) | Separate QueryFlux Studio repository: clusters, queries, routing — talks to QueryFlux **admin API** |
+| [queryflux-studio](https://github.com/lakeops-org/queryflux-studio) | Separate QueryFlux Studio repository: clusters, queries, routing — talks to QueryFlux **admin API** |
 | `examples/` | **Self-contained** compose files; run from each subdirectory |
 | `docker/` | Compose for **repo development** (`make env` / `make test-e2e`) and **Dockerfile** trees |
 | `grafana/` · `prometheus/` | Dashboards and sample Prometheus config |

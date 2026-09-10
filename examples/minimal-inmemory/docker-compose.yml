@@ -39,7 +39,7 @@ services:
     restart: unless-stopped
 
   queryflux-studio:
-    image: ghcr.io/lakeops-org/queryflux-console:latest
+    image: ghcr.io/lakeops-org/queryflux-studio:latest
     ports:
       - "3000:3000"
     environment:

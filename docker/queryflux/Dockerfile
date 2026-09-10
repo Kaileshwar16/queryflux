@@ -17,7 +17,7 @@
 #
 # Final `cargo build` has no `--locked` (stub vs full crate sources); `cargo chef cook` uses `--locked`.
 
-ARG QUERYFLUX_CONSOLE_IMAGE=ghcr.io/lakeops-org/queryflux-console:latest
+ARG QUERYFLUX_STUDIO_IMAGE=ghcr.io/lakeops-org/queryflux-studio:latest
 
 # =============================================================================
 # Chef base — Python + Rust (rustup, cargo-chef)
@@ -141,7 +141,7 @@ RUN set -eu; command -v dbc; dbc install trino \
 # =============================================================================
 # QueryFlux Console — pre-built standalone image used by runtime-unified
 # =============================================================================
-FROM ${QUERYFLUX_CONSOLE_IMAGE} AS studio-image
+FROM ${QUERYFLUX_STUDIO_IMAGE} AS studio-image
 
 # =============================================================================
 # Runtime: server + Studio + Node (bundled UI)
