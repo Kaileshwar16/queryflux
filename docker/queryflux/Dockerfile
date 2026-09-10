@@ -139,7 +139,7 @@ RUN set -eu; command -v dbc; dbc install trino \
  && dbc install bigquery
 
 # =============================================================================
-# QueryFlux Console — pre-built standalone image used by runtime-unified
+# QueryFlux Studio — pre-built standalone image used by runtime-unified
 # =============================================================================
 FROM ${QUERYFLUX_STUDIO_IMAGE} AS studio-image
 
