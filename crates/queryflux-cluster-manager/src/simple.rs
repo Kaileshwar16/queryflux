@@ -93,19 +93,22 @@ impl ClusterGroupManager for SimpleClusterGroupManager {
         // fill `chosen` to capacity or a health check can mark it unhealthy in that
         // window. Re-validate before admitting the query, falling back to any other
         // still-eligible member rather than trusting a snapshot that may be stale.
-        let chosen = if chosen.is_enabled() && chosen.is_healthy() && !chosen.is_at_capacity() {
-            chosen
-        } else {
-            match eligible
-                .iter()
-                .find(|(_, c)| c.is_enabled() && c.is_healthy() && !c.is_at_capacity())
-            {
-                Some((_, c)) => *c,
-                None => return Ok(None),
+        if chosen.is_enabled() && chosen.is_healthy() && chosen.try_increment_running() {
+            return Ok(Some(chosen.cluster_name.clone()));
+        }
+
+        for (_, candidate) in &eligible {
+            if Arc::ptr_eq(candidate, chosen) {
+                continue;
             }
-        };
-        chosen.increment_running();
-        Ok(Some(chosen.cluster_name.clone()))
+
+            if candidate.is_enabled() && candidate.is_healthy() && candidate.try_increment_running()
+            {
+                return Ok(Some(candidate.cluster_name.clone()));
+            }
+        }
+
+        Ok(None)
     }
 
     async fn release_cluster(&self, group: &ClusterGroupName, cluster: &ClusterName) -> Result<()> {
