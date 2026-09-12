@@ -780,6 +780,46 @@ mod session_schema {
     }
 
     #[tokio::test]
+    async fn missing_database_stays_unset_in_query_context() {
+        let h = WireTestHarness::new(0, 0).await.expect("harness");
+        let observed = observe(&h).await;
+
+        let response: serde_json::Value = reqwest::Client::new()
+            .post(format!("{}/session/v1/login-request", h.base_url()))
+            .json(&json!({
+                "data": {
+                    "LOGIN_NAME": "testuser"
+                }
+            }))
+            .send()
+            .await
+            .expect("login request")
+            .json()
+            .await
+            .expect("login response");
+
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["data"]["sessionInfo"]["databaseName"], "");
+
+        let mut client = SnowflakeWireClient::new(&h.base_url());
+        client.session_token = Some(
+            response["data"]["token"]
+                .as_str()
+                .expect("token")
+                .to_string(),
+        );
+
+        let result = client.query("SELECT 1", None).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let session = observed.query.lock().unwrap().last().unwrap().clone();
+
+        assert_eq!(session.catalog(), None);
+
+        client.logout().await.expect("logout");
+    }
+
+    #[tokio::test]
     async fn login_and_use_schema_reach_query_context_and_catalog_lookup() {
         let h = WireTestHarness::new(0, 0).await.expect("harness");
         let observed = observe(&h).await;

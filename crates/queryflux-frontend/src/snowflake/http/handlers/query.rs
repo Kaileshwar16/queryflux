@@ -163,8 +163,8 @@ pub async fn query_request(
             Some((_, session)) => (
                 session.auth_ctx.clone(),
                 session.group.clone(),
-                session.database.clone().unwrap_or_default(),
-                session.schema.clone().unwrap_or_default(),
+                session.database.clone(),
+                session.schema.clone(),
                 session.role.clone(),
                 session.warehouse.clone(),
                 session.password.clone(),
@@ -222,7 +222,11 @@ pub async fn query_request(
             }
         }
         let query_id = Uuid::new_v4().to_string();
-        return synthetic_ok_sink().into_response(&query_id, &database, &schema_name);
+        return synthetic_ok_sink().into_response(
+            &query_id,
+            database.as_deref().unwrap_or_default(),
+            schema_name.as_deref().unwrap_or_default(),
+        );
     }
 
     // Wire v1 uses "parameterBindings" (SQL API v2 uses "bindings").
@@ -235,8 +239,8 @@ pub async fn query_request(
     if let Some(warehouse) = &warehouse {
         extra.insert("snowflake.warehouse".to_string(), warehouse.clone());
     }
-    if !schema_name.is_empty() {
-        extra.insert("snowflake.schema".to_string(), schema_name.clone());
+    if let Some(schema) = schema_name.as_ref().filter(|s| !s.is_empty()) {
+        extra.insert("snowflake.schema".to_string(), schema.clone());
     }
     // Only meaningful for `queryAuth: passthrough` clusters — `AdbcAdapter` fails closed if
     // these are absent and the resolved credentials are `Passthrough`; harmless to include
@@ -257,7 +261,7 @@ pub async fn query_request(
         // Keep the shared schema hint in sync with the Snowflake backend override.
         database: extra.get("snowflake.schema").cloned(),
         // Snowflake's database is the catalog in catalog.database.table.
-        catalog: Some(database.clone()),
+        catalog: database.clone(),
         tags: QueryTags::default(),
         extra,
         agent_context: None,
@@ -284,13 +288,19 @@ pub async fn query_request(
     )
     .await
     {
-        SpawnExecuteResult::Completed(Ok(()), sink) => {
-            sink.into_response(&query_id, &database, &schema_name)
-        }
+        SpawnExecuteResult::Completed(Ok(()), sink) => sink.into_response(
+            &query_id,
+            database.as_deref().unwrap_or_default(),
+            schema_name.as_deref().unwrap_or_default(),
+        ),
         SpawnExecuteResult::Completed(Err(e), mut sink) => {
             warn!(query_id = %query_id, "Snowflake wire query error: {e}");
             sink.error = Some(e.to_string());
-            sink.into_response(&query_id, &database, &schema_name)
+            sink.into_response(
+                &query_id,
+                database.as_deref().unwrap_or_default(),
+                schema_name.as_deref().unwrap_or_default(),
+            )
         }
         SpawnExecuteResult::Cancelled => (
             StatusCode::OK,

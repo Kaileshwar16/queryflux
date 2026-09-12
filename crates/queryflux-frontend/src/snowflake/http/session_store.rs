@@ -148,16 +148,14 @@ impl SnowflakeSessionStore {
         token: &str,
         database: Option<String>,
         schema: Option<String>,
-    ) -> Option<(String, String)> {
+    ) -> Option<(Option<String>, Option<String>)> {
         let mut entry = self.sessions.get_mut(token)?;
         if database.is_some() {
             entry.database = database;
         }
         entry.schema = schema;
-        Some((
-            entry.database.clone().unwrap_or_default(),
-            entry.schema.clone().unwrap_or_default(),
-        ))
+
+        Some((entry.database.clone(), entry.schema.clone()))
     }
 
     /// Update the tracked role for `token` (e.g. from a `USE ROLE` statement).
