@@ -240,9 +240,9 @@ pub async fn query_request(
 
     let session_ctx = SessionContext {
         user: Some(auth_ctx.user.clone()),
-        database: Some(database.clone()),
-        // See the matching comment in snowflake/http/handlers/session.rs — mapped
-        // onto our catalog.database.table model as catalog, not database.
+        // Keep the shared schema hint in sync with the Snowflake backend override.
+        database: extra.get("snowflake.schema").cloned(),
+        // Snowflake's database is the catalog in catalog.database.table.
         catalog: Some(database.clone()),
         tags: QueryTags::default(),
         extra,
