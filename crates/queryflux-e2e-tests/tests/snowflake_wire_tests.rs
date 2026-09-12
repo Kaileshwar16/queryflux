@@ -830,6 +830,90 @@ mod session_schema {
     }
 
     #[tokio::test]
+    async fn use_namespace_reaches_next_query_context() {
+        let h = WireTestHarness::new(0, 0).await.expect("harness");
+        let observed = observe(&h).await;
+        for (sql, catalog, schema) in [
+            ("USE SCHEMA SALES", "REPORTING", Some("SALES")),
+            ("USE SCHEMA ARCHIVE.SALES", "ARCHIVE", Some("SALES")),
+            (r#"USE SCHEMA "ARCHIVE"."SALES""#, "ARCHIVE", Some("SALES")),
+            (
+                r#"USE SCHEMA "Archive.Db"."Sa""les.Data""#,
+                "Archive.Db",
+                Some("Sa\"les.Data"),
+            ),
+            (
+                r#"USE SCHEMA "ARCHIVE.SALES""#,
+                "REPORTING",
+                Some("ARCHIVE.SALES"),
+            ),
+            ("USE DATABASE ARCHIVE", "ARCHIVE", None),
+            ("USE ARCHIVE", "ARCHIVE", None),
+            (r#"USE DATABASE "Archive.Db""#, "Archive.Db", None),
+        ] {
+            let mut client = login(&h, Some("ANALYTICS")).await;
+            let selected = client.query("USE SCHEMA PREVIOUS", None).await.unwrap();
+            assert!(selected.success, "{:?}", selected.error);
+            observed.query.lock().unwrap().clear();
+
+            let response: serde_json::Value = reqwest::Client::new()
+                .post(format!("{}/queries/v1/query-request", h.base_url()))
+                .header(
+                    "Authorization",
+                    format!(
+                        "Snowflake Token=\"{}\"",
+                        client.session_token.as_ref().unwrap()
+                    ),
+                )
+                .json(&json!({"sqlText": sql}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(response["success"], true, "{sql}: {response}");
+            assert_eq!(response["data"]["finalDatabaseName"], catalog, "{sql}");
+            assert_eq!(
+                response["data"]["finalSchemaName"],
+                schema.unwrap_or_default(),
+                "{sql}"
+            );
+            assert!(
+                observed.query.lock().unwrap().is_empty(),
+                "USE must stay local"
+            );
+
+            let result = client.query("SELECT 1", None).await.unwrap();
+            assert!(result.success, "{sql}: {:?}", result.error);
+            let sessions = observed.query.lock().unwrap().clone();
+            assert_eq!(sessions.len(), 1, "{sql}");
+            assert_eq!(sessions[0].catalog(), Some(catalog), "{sql}");
+            assert_eq!(sessions[0].database(), schema, "{sql}");
+            assert_eq!(
+                sessions[0]
+                    .extra
+                    .get("snowflake.schema")
+                    .map(String::as_str),
+                schema,
+                "{sql}"
+            );
+            assert_eq!(
+                sessions[0].extra.get("snowflake.role").map(String::as_str),
+                Some("ANALYST")
+            );
+            assert_eq!(
+                sessions[0]
+                    .extra
+                    .get("snowflake.warehouse")
+                    .map(String::as_str),
+                Some("ANALYTICS_WH")
+            );
+            client.logout().await.expect("logout");
+        }
+    }
+
+    #[tokio::test]
     async fn missing_or_empty_schema_does_not_use_database_as_schema() {
         let h = WireTestHarness::new(0, 0).await.expect("harness");
         let observed = observe(&h).await;

@@ -14,6 +14,11 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use polyglot_sql::{
+    dialects::Dialect,
+    tokens::{Token, TokenType},
+    DialectType,
+};
 use queryflux_core::{
     error::Result,
     query::{FrontendProtocol, QueryStats},
@@ -187,7 +192,9 @@ pub async fn query_request(
     // pooled connection shared across unrelated sessions would leak state between them (see
     // `AdbcAdapter`'s session-scoped sub-pool, which is what a *real* query after one of these
     // statements routes through instead).
-    if let Some((target, value)) = try_parse_snowflake_use(&sql) {
+    if let Some((target, mut names)) = try_parse_snowflake_use(&sql) {
+        // Parsing guarantees one identifier, or two for a qualified schema.
+        let value = names.pop().expect("USE has an identifier");
         match target {
             // The response envelope only echoes database/schema (see `into_response` below),
             // so only those two need a local update — the setter call is what actually matters
@@ -198,13 +205,20 @@ pub async fn query_request(
             SnowflakeUseTarget::Role => {
                 state.sessions.set_role(&token, Some(value));
             }
-            SnowflakeUseTarget::Database => {
-                state.sessions.set_database(&token, Some(value.clone()));
-                database = value;
-            }
-            SnowflakeUseTarget::Schema => {
-                state.sessions.set_schema(&token, Some(value.clone()));
-                schema_name = value;
+            SnowflakeUseTarget::Database | SnowflakeUseTarget::Schema => {
+                let (new_database, new_schema) = if target == SnowflakeUseTarget::Database {
+                    (Some(value), None)
+                } else {
+                    (names.pop(), Some(value))
+                };
+                let Some(namespace) =
+                    state
+                        .sessions
+                        .set_namespace(&token, new_database, new_schema)
+                else {
+                    return unauthorized();
+                };
+                (database, schema_name) = namespace;
             }
         }
         let query_id = Uuid::new_v4().to_string();
@@ -412,29 +426,20 @@ fn strip_use_keyword<'a>(s_lower: &str, s: &'a str, keyword_lower: &str) -> Opti
     }
 }
 
-/// Strip Snowflake's `"`-quoted identifier form, segment by segment, so a qualified
-/// `db."My Schema"` / `"My Db".schema` parses correctly and not just a bare quoted identifier.
-fn strip_snowflake_quotes(s: &str) -> String {
-    s.split('.')
-        .map(|part| part.trim().trim_matches('"'))
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
 /// Parse `USE WAREHOUSE <x>` / `USE ROLE <x>` / `USE DATABASE <x>` / bare `USE <x>` (= database)
 /// / `USE SCHEMA <x>` (including qualified `db.schema`) sent as `sqlText`. Returns `None` for
 /// anything else so the caller falls through to normal dispatch.
 ///
-/// A hand-rolled fast-path parse, not a full AST parse — mirrors `try_parse_use` in
-/// `mysql_wire/mod.rs`; queryflux's `polyglot-sql` parser runs at translation time, not as a
-/// cheap pre-dispatch check, and reaching for it here would add latency to the common
-/// no-override case this fast path exists to keep cheap.
+/// Reuse polyglot-sql's Snowflake tokenizer for identifier boundaries and unescaping.
+/// Its USE AST flattens qualified names, losing the distinction between `db.schema`
+/// and `"db.schema"`, so retain the identifier tokens instead. Non-USE queries avoid
+/// tokenization entirely. Identifier case is preserved, as in the existing wire path.
 ///
 /// Order matters: the multi-word forms (`use warehouse`/`use role`/`use schema`/`use database`)
 /// must be checked before bare `use`, since `use` is itself a whitespace-terminated prefix of
 /// all of them — checking bare `use` first would misparse `USE WAREHOUSE X` as `USE <database>`
 /// with value `"warehouse x"`.
-fn try_parse_snowflake_use(sql: &str) -> Option<(SnowflakeUseTarget, String)> {
+fn try_parse_snowflake_use(sql: &str) -> Option<(SnowflakeUseTarget, Vec<String>)> {
     let s = sql.trim().trim_end_matches(';');
     let s_lower = s.to_lowercase();
 
@@ -452,27 +457,34 @@ fn try_parse_snowflake_use(sql: &str) -> Option<(SnowflakeUseTarget, String)> {
         return None;
     };
 
-    let raw_value = rest.trim();
-    if raw_value.is_empty() || !looks_like_identifier(raw_value) {
-        // Rejects e.g. `USE SECONDARY ROLES ALL` — a real, different Snowflake statement
-        // that also starts with `USE` and would otherwise be misparsed as a bare `USE
-        // <database>` naming the literal (unquoted, multi-word) database "SECONDARY ROLES
-        // ALL". An unquoted identifier can never legitimately contain whitespace, so
-        // anything that does isn't a simple single-target USE statement at all — fall
-        // through to normal dispatch instead of guessing wrong.
-        return None;
-    }
-    Some((target, strip_snowflake_quotes(raw_value)))
+    let tokens = Dialect::get(DialectType::Snowflake).tokenize(rest).ok()?;
+    let names = match tokens.as_slice() {
+        [name] if is_use_identifier(name) => vec![name.text.clone()],
+        [database, dot, schema]
+            if target == SnowflakeUseTarget::Schema
+                && dot.token_type == TokenType::Dot
+                && is_use_identifier(database)
+                && is_use_identifier(schema) =>
+        {
+            vec![database.text.clone(), schema.text.clone()]
+        }
+        _ => return None,
+    };
+    Some((target, names))
 }
 
-/// True if every dot-separated segment of `value` is either quoted (`"..."`, where internal
-/// whitespace is fine — e.g. `"My Db"`) or a bare token with no whitespace. Used to reject
-/// non-identifier content (like `SECONDARY ROLES ALL`) that happens to appear after `USE`.
-fn looks_like_identifier(value: &str) -> bool {
-    value.split('.').all(|part| {
-        let part = part.trim();
-        part.starts_with('"') || !part.contains(char::is_whitespace)
-    })
+fn is_use_identifier(token: &Token) -> bool {
+    if token.token_type == TokenType::QuotedIdentifier {
+        return !token.text.is_empty();
+    }
+    (token.token_type == TokenType::Var || token.token_type.is_keyword())
+        && token
+            .text
+            .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && token
+            .text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
 // ---------------------------------------------------------------------------
@@ -513,28 +525,28 @@ mod tests {
     fn parses_use_warehouse() {
         let (target, value) = try_parse_snowflake_use("USE WAREHOUSE ANALYTICS_WH").unwrap();
         assert_eq!(target, SnowflakeUseTarget::Warehouse);
-        assert_eq!(value, "ANALYTICS_WH");
+        assert_eq!(value, ["ANALYTICS_WH"]);
     }
 
     #[test]
     fn parses_use_role() {
         let (target, value) = try_parse_snowflake_use("use role sysadmin").unwrap();
         assert_eq!(target, SnowflakeUseTarget::Role);
-        assert_eq!(value, "sysadmin");
+        assert_eq!(value, ["sysadmin"]);
     }
 
     #[test]
     fn parses_use_database_keyword() {
         let (target, value) = try_parse_snowflake_use("USE DATABASE PROD").unwrap();
         assert_eq!(target, SnowflakeUseTarget::Database);
-        assert_eq!(value, "PROD");
+        assert_eq!(value, ["PROD"]);
     }
 
     #[test]
     fn bare_use_is_database() {
         let (target, value) = try_parse_snowflake_use("USE PROD").unwrap();
         assert_eq!(target, SnowflakeUseTarget::Database);
-        assert_eq!(value, "PROD");
+        assert_eq!(value, ["PROD"]);
     }
 
     #[test]
@@ -543,33 +555,73 @@ mod tests {
         // would misparse as `USE <database>` with value "warehouse x".
         let (target, value) = try_parse_snowflake_use("USE WAREHOUSE X").unwrap();
         assert_eq!(target, SnowflakeUseTarget::Warehouse);
-        assert_eq!(value, "X");
+        assert_eq!(value, ["X"]);
     }
 
     #[test]
     fn parses_use_schema_qualified() {
         let (target, value) = try_parse_snowflake_use("USE SCHEMA mydb.myschema").unwrap();
         assert_eq!(target, SnowflakeUseTarget::Schema);
-        assert_eq!(value, "mydb.myschema");
+        assert_eq!(value, ["mydb", "myschema"]);
     }
 
     #[test]
     fn strips_double_quoted_identifiers() {
         let (_, value) = try_parse_snowflake_use(r#"USE ROLE "My Role""#).unwrap();
-        assert_eq!(value, "My Role");
+        assert_eq!(value, ["My Role"]);
     }
 
     #[test]
     fn strips_double_quotes_on_each_qualified_segment() {
         let (_, value) = try_parse_snowflake_use(r#"USE SCHEMA "My Db"."My Schema""#).unwrap();
-        assert_eq!(value, "My Db.My Schema");
+        assert_eq!(value, ["My Db", "My Schema"]);
+    }
+
+    #[test]
+    fn preserves_quoted_dots_and_unescapes_quotes() {
+        for (sql, expected) in [
+            (r#"USE SCHEMA "ARCHIVE"."SALES""#, vec!["ARCHIVE", "SALES"]),
+            (
+                r#"USE SCHEMA "Archive.Db" . "Sa""les.Data""#,
+                vec!["Archive.Db", "Sa\"les.Data"],
+            ),
+            (r#"USE SCHEMA "ARCHIVE.SALES""#, vec!["ARCHIVE.SALES"]),
+            (
+                r#"USE SCHEMA ARCHIVE."My Sales""#,
+                vec!["ARCHIVE", "My Sales"],
+            ),
+            ("USE SCHEMA SALES", vec!["SALES"]),
+        ] {
+            let (target, names) = try_parse_snowflake_use(sql).unwrap();
+            assert_eq!(target, SnowflakeUseTarget::Schema);
+            assert_eq!(names, expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_or_nonliteral_names() {
+        for sql in [
+            "USE SCHEMA .SALES",
+            "USE SCHEMA ARCHIVE.",
+            "USE SCHEMA ARCHIVE..SALES",
+            "USE SCHEMA A.B.C",
+            "USE DATABASE ARCHIVE.SALES",
+            r#"USE SCHEMA "unclosed"#,
+            r#"USE SCHEMA "SALES" trailing"#,
+            r#"USE SCHEMA """#,
+            "USE SCHEMA 'SALES'",
+            "USE SCHEMA SALES; SELECT 1",
+            "USE SCHEMA IDENTIFIER($schema)",
+        ] {
+            assert!(try_parse_snowflake_use(sql).is_none(), "{sql}");
+        }
     }
 
     #[test]
     fn handles_trailing_semicolon_and_whitespace() {
         let (target, value) = try_parse_snowflake_use("  USE WAREHOUSE X  ;  ").unwrap();
         assert_eq!(target, SnowflakeUseTarget::Warehouse);
-        assert_eq!(value, "X");
+        assert_eq!(value, ["X"]);
     }
 
     #[test]
@@ -605,7 +657,7 @@ mod tests {
     fn bare_use_still_accepts_a_quoted_database_identifier_with_spaces() {
         let (target, value) = try_parse_snowflake_use(r#"USE "My Db""#).unwrap();
         assert_eq!(target, SnowflakeUseTarget::Database);
-        assert_eq!(value, "My Db");
+        assert_eq!(value, ["My Db"]);
     }
 
     #[test]
