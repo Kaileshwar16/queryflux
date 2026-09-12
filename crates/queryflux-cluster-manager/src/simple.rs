@@ -98,10 +98,6 @@ impl ClusterGroupManager for SimpleClusterGroupManager {
         }
 
         for (_, candidate) in &eligible {
-            if Arc::ptr_eq(candidate, chosen) {
-                continue;
-            }
-
             if candidate.is_enabled() && candidate.is_healthy() && candidate.try_increment_running()
             {
                 return Ok(Some(candidate.cluster_name.clone()));
