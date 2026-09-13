@@ -988,8 +988,20 @@ mod session_schema {
             .query("SELECT table_name FROM tables LIMIT 1", None)
             .await
             .unwrap();
-        assert!(result.success, "{:?}", result.error);
-        assert_eq!(result.total_rows, 1);
+        eprintln!(
+            "starrocks schema probe: success={}, total_rows={}, error={:?}",
+            result.success, result.total_rows, result.error
+        );
+        assert!(
+            result.success,
+            "StarRocks schema probe failed: error={:?}, total_rows={}",
+            result.error, result.total_rows
+        );
+        assert_eq!(
+            result.total_rows, 1,
+            "StarRocks schema probe succeeded but returned an unexpected row count; error={:?}",
+            result.error
+        );
         client.logout().await.expect("logout");
     }
 }
