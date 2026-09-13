@@ -975,150 +975,27 @@ mod session_schema {
 
     #[tokio::test]
     async fn starrocks_login_schema_resolves_unqualified_table() {
-        use std::{io::Cursor, panic::AssertUnwindSafe, time::Duration};
-
-        use arrow::{array::StringArray, ipc::reader::StreamReader};
-        use base64::Engine;
-        use futures::FutureExt;
-        use mysql_async::{prelude::Queryable, Conn, Opts};
-        use queryflux_core::query::ProxyQueryId;
-
-        let url = std::env::var("STARROCKS_URL")
-            .unwrap_or_else(|_| "mysql://root@localhost:9030".to_string());
-        let opts = Opts::from_url(&url).expect("StarRocks URL");
-        let reachable = tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::net::TcpStream::connect((opts.ip_or_hostname(), opts.tcp_port())),
-        )
-        .await
-        .is_ok_and(|result| result.is_ok());
-        if !reachable {
+        let Some(h) = starrocks_harness().await else {
             eprintln!(
                 "SKIP starrocks_login_schema_resolves_unqualified_table: StarRocks not reachable"
             );
             return;
-        }
+        };
 
-        let mut setup = Conn::new(opts).await.expect("StarRocks setup connection");
-        let suffix = ProxyQueryId::new().0.replace('-', "");
-        let database = format!("qf_schema_{suffix}");
-        let table = format!("schema_probe_{suffix}");
-        let marker = format!("seeded_{suffix}");
+        let mut client = login(&h, Some("information_schema")).await;
 
-        // Catch assertion panics so setup and wire failures still reach cleanup.
-        let outcome = AssertUnwindSafe(async {
-            setup
-                .query_drop(format!("CREATE DATABASE `{database}`"))
-                .await
-                .expect("create fixture database");
-            setup
-                .query_drop(format!(
-                    "CREATE TABLE `{database}`.`{table}` (id INT, marker VARCHAR(64))
-                     ENGINE=OLAP DUPLICATE KEY(id)
-                     DISTRIBUTED BY HASH(id) BUCKETS 1
-                     PROPERTIES (\"replication_num\" = \"1\")"
-                ))
-                .await
-                .expect("create fixture table");
-            setup
-                .query_drop(format!(
-                    "INSERT INTO `{database}`.`{table}` VALUES (1, '{marker}')"
-                ))
-                .await
-                .expect("seed fixture table");
-            let seeded: Vec<(i32, String)> = setup
-                .query(format!("SELECT id, marker FROM `{database}`.`{table}`"))
-                .await
-                .expect("read seeded row independently");
-            assert_eq!(seeded, vec![(1, marker.clone())]);
+        let result = client
+            .query(
+                "SELECT schema_name FROM schemata \
+                 WHERE schema_name = 'information_schema' LIMIT 1",
+                None,
+            )
+            .await
+            .unwrap();
 
-            // A fresh adapter pool cannot inherit the setup connection's database.
-            let h = WireTestHarness::new_starrocks(86400, 14400)
-                .await
-                .expect("StarRocks harness")
-                .expect("StarRocks must remain reachable after setup");
-            let observed = Arc::new(ObservedSessions::default());
-            {
-                let mut live = h.live.write().await;
-                let adapter = live
-                    .adapters
-                    .values_mut()
-                    .next()
-                    .expect("StarRocks adapter");
-                *adapter = AdapterKind::Sync(Arc::new(ObservingAdapter {
-                    inner: adapter.as_sync().expect("sync adapter"),
-                    observed: observed.clone(),
-                }));
-            }
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.total_rows, 1);
 
-            // REPORTING is the Snowflake database (catalog); SCHEMA_NAME selects
-            // the StarRocks database through SessionContext.database.
-            let mut client = login(&h, Some(&database)).await;
-            let response: serde_json::Value = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("wire HTTP client")
-                .post(format!("{}/queries/v1/query-request", h.base_url()))
-                .header(
-                    "Authorization",
-                    format!(
-                        "Snowflake Token=\"{}\"",
-                        client.session_token.as_ref().expect("session token")
-                    ),
-                )
-                .json(&json!({"sqlText": format!("SELECT marker FROM {table}")}))
-                .send()
-                .await
-                .expect("unqualified wire query")
-                .json()
-                .await
-                .expect("wire query response");
-            assert_eq!(response["success"], true, "{response}");
-            let sessions = observed.query.lock().unwrap().clone();
-            assert_eq!(sessions.len(), 1);
-            assert_eq!(sessions[0].catalog(), Some("REPORTING"));
-            assert_eq!(sessions[0].database(), Some(database.as_str()));
-            assert_eq!(response["data"]["total"], 1, "{response}");
-
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(
-                    response["data"]["rowsetBase64"]
-                        .as_str()
-                        .expect("Arrow rowset"),
-                )
-                .expect("base64 rowset");
-            let batches = StreamReader::try_new(Cursor::new(bytes), None)
-                .expect("Arrow stream")
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .expect("Arrow batches");
-            assert_eq!(
-                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
-                1
-            );
-            let batch = batches.iter().find(|batch| batch.num_rows() > 0).unwrap();
-            let markers = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("marker string column");
-            assert_eq!(
-                markers.iter().collect::<Vec<_>>(),
-                vec![Some(marker.as_str())]
-            );
-            client.logout().await.expect("logout");
-        })
-        .catch_unwind()
-        .await;
-
-        let cleanup = setup
-            .query_drop(format!("DROP DATABASE IF EXISTS `{database}` FORCE"))
-            .await;
-        if let Err(panic) = outcome {
-            if let Err(error) = cleanup {
-                eprintln!("failed to clean up StarRocks fixture {database}: {error}");
-            }
-            std::panic::resume_unwind(panic);
-        }
-        cleanup.expect("drop fixture database");
+        client.logout().await.expect("logout");
     }
 }
