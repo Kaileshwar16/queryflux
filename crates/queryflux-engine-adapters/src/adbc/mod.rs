@@ -6,7 +6,6 @@ use adbc_driver_manager::{ManagedDatabase, ManagedDriver};
 use arrow::array::Array;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use dashmap::DashMap;
 use queryflux_core::{
     catalog::TableSchema,
     config::ClusterConfig,
@@ -28,12 +27,14 @@ mod bigquery;
 mod databricks;
 mod introspection;
 mod redshift;
+mod scoped_pools;
 mod snowflake;
 mod sql_helpers;
 #[cfg(test)]
 mod test_fixtures;
 
 use introspection::AdbcIntrospection;
+use scoped_pools::{ScopedPools, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_COUNT};
 
 const DEFAULT_POOL_SIZE: u32 = 4;
 
@@ -172,6 +173,10 @@ pub struct AdbcConfig {
     /// JSON key `flightSqlClusterDialect`; legacy `flightSqlEngine` is still accepted when parsing.
     pub flight_sql_cluster_dialect: Option<String>,
     pub pool_size: u32,
+    /// Idle expiry since the last scoped-pool lookup; defaults to 900 seconds.
+    pub scoped_pool_idle_timeout_secs: u64,
+    /// Maximum cached identity/session scopes per cluster; defaults to 500.
+    pub scoped_pool_max_count: usize,
 }
 
 impl AdbcConfig {
@@ -355,6 +360,28 @@ impl crate::EngineConfigParseable for AdbcConfig {
             .unwrap_or(DEFAULT_POOL_SIZE)
             .max(1);
 
+        let positive_integer = |field: &str, default: u64| -> Result<u64> {
+            match json.get(field) {
+                None => Ok(default),
+                Some(value) => value.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+                    QueryFluxError::Engine(format!(
+                        "cluster '{cluster_name}': {field} must be a positive integer"
+                    ))
+                }),
+            }
+        };
+        let scoped_pool_idle_timeout_secs =
+            positive_integer("scopedPoolIdleTimeoutSecs", DEFAULT_IDLE_TIMEOUT_SECS)?;
+        let scoped_pool_max_count = usize::try_from(positive_integer(
+            "scopedPoolMaxCount",
+            DEFAULT_MAX_COUNT as u64,
+        )?)
+        .map_err(|_| {
+            QueryFluxError::Engine(format!(
+                "cluster '{cluster_name}': scopedPoolMaxCount is too large"
+            ))
+        })?;
+
         Ok(Self {
             driver,
             uri,
@@ -365,6 +392,8 @@ impl crate::EngineConfigParseable for AdbcConfig {
             db_kwargs,
             flight_sql_cluster_dialect,
             pool_size,
+            scoped_pool_idle_timeout_secs,
+            scoped_pool_max_count,
         })
     }
 
@@ -479,17 +508,6 @@ fn compute_scoped_pool_size(key: &PoolScopeKey, base_pool_size: u32) -> u32 {
     }
 }
 
-/// Small dedicated pool, built on demand for a distinct [`PoolScopeKey`]. Kept separate from
-/// the static `pool` (Type 1 / `serviceAccount`) because its `ManagedDatabase` bakes in
-/// per-scope connection options — there is no way to swap credentials, role, warehouse, or
-/// schema on a checked-out connection from a shared pool, so a distinct scope needs a
-/// distinct `ManagedDatabase`. Idle eviction keeps this from growing unbounded across a
-/// long-running process; see `AdbcAdapter::scoped_pool_for`.
-struct ScopedPoolEntry {
-    pool: AdbcPool,
-    last_used: std::time::Instant,
-}
-
 /// Max connections in a sub-pool keyed (at least partly) by `token` — i.e. genuinely
 /// per-individual-identity, not shared across sessions. Deliberately small — this exists to
 /// amortize the OAuth-token-scoped connection setup cost across the handful of queries a user
@@ -498,13 +516,6 @@ struct ScopedPoolEntry {
 /// combination — e.g. "every analyst" — so it uses the cluster's own `pool_size` instead; see
 /// `AdbcAdapter::scoped_pool_size`.
 const IDENTITY_POOL_MAX_SIZE: u32 = 2;
-
-/// Evict a sub-pool after this long without use. Roughly matches how often the resolver's own
-/// token cache refreshes (tokens are typically short-lived), so a per-identity pool rarely
-/// outlives the token it was built for by much. Applied uniformly to role/warehouse/schema-only
-/// pools too — those are cheap to rebuild (no token validation), so evicting them on the same
-/// schedule costs little and keeps one eviction policy instead of two.
-const IDENTITY_POOL_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// Bound on building a scoped `ManagedDatabase` (the driver FFI call that can involve real
 /// OAuth token validation) — see `AdbcAdapter::scoped_pool_for`.
@@ -518,15 +529,6 @@ const IDENTITY_POOL_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// piling up on the shared tokio blocking thread pool. Combined with single-flighting
 /// same-key builds (below), this bounds worst-case blocking-thread usage from this path.
 const IDENTITY_POOL_MAX_CONCURRENT_BUILDS: usize = 8;
-
-/// Hard ceiling on the number of distinct scoped sub-pools a cluster keeps at once, evicting
-/// the least-recently-used entry once it's reached. `IDENTITY_POOL_IDLE_TTL` alone only bounds
-/// growth *over time* (15 minutes), not *in the moment* — role/warehouse/schema values come
-/// straight from client `USE ROLE`/`USE WAREHOUSE`/`USE SCHEMA` statements with no check that
-/// they exist on the backend, so a client cycling through many distinct values in a loop could
-/// otherwise force an unbounded number of real backend connections and driver-FFI build calls
-/// before the idle sweep ever catches up.
-const SCOPED_POOL_MAX_ENTRIES: usize = 500;
 
 /// Per-driver OAuth connection-option keys for `tokenExchange`. Only `snowflake` is wired in
 /// this release — must stay in sync with `ADBC_TOKEN_EXCHANGE_DRIVERS` in
@@ -654,11 +656,7 @@ pub struct AdbcAdapter {
     /// scopes, which are shared across sessions and need the same concurrency as the base
     /// pool — not the small per-identity size used for token-keyed scopes.
     base_pool_size: u32,
-    scoped_pools: Arc<DashMap<PoolScopeKey, ScopedPoolEntry>>,
-    /// Per-key single-flight locks — serializes concurrent cache-miss builds for the same
-    /// scope so a burst of queries builds exactly one pool instead of racing to build (and
-    /// discard all but the last of) several. See `scoped_pool_for`.
-    scoped_pool_build_locks: Arc<DashMap<PoolScopeKey, Arc<tokio::sync::Mutex<()>>>>,
+    scoped_pools: Arc<ScopedPools<AdbcConnectionManager<ManagedDatabase>>>,
     /// Caps total concurrent scoped-pool builds across all keys. See
     /// `IDENTITY_POOL_MAX_CONCURRENT_BUILDS`.
     scoped_pool_build_semaphore: Arc<tokio::sync::Semaphore>,
@@ -675,6 +673,11 @@ impl AdbcAdapter {
         group_name: ClusterGroupName,
         config: AdbcConfig,
     ) -> Result<Self> {
+        if config.scoped_pool_idle_timeout_secs == 0 || config.scoped_pool_max_count == 0 {
+            return Err(QueryFluxError::Engine(
+                "ADBC scoped pool idle timeout and max count must be positive".into(),
+            ));
+        }
         let engine_type = config.engine_type();
         let translation_dialect = config.flight_sql_translation_dialect();
         let driver_name = config.driver.clone();
@@ -745,6 +748,13 @@ impl AdbcAdapter {
             pool.clone(),
         );
 
+        let scoped_pools = Arc::new(ScopedPools::new(
+            std::time::Duration::from_secs(config.scoped_pool_idle_timeout_secs),
+            config.scoped_pool_max_count,
+            &group_name.0,
+            &cluster_name.0,
+        ));
+
         Ok(Self {
             cluster_name,
             group_name,
@@ -754,8 +764,7 @@ impl AdbcAdapter {
             base_uri,
             base_db_kwargs,
             base_pool_size: config.pool_size,
-            scoped_pools: Arc::new(DashMap::new()),
-            scoped_pool_build_locks: Arc::new(DashMap::new()),
+            scoped_pools,
             scoped_pool_build_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 IDENTITY_POOL_MAX_CONCURRENT_BUILDS,
             )),
@@ -850,71 +859,20 @@ impl AdbcAdapter {
 
     /// Return the dedicated pool for `key`, building (and caching) it on first use.
     ///
-    /// The cache-hit path is a cheap `DashMap` lookup, safe to call directly from async
-    /// context. The cache-miss path calls the driver FFI (`new_database_with_opts`) — a
-    /// genuinely blocking call (Snowflake's driver validates an OAuth token or resolves a
-    /// role/warehouse, either of which can mean real network I/O), so it runs inside
-    /// `spawn_blocking` rather than directly on the async executor — an earlier version of
-    /// this comment claimed it "rides along" on `execute_as_arrow`'s own `spawn_blocking`,
-    /// which was wrong: this is called *before* that, so without its own `spawn_blocking` it
-    /// would have blocked whatever tokio worker thread happened to be running the query. Also
-    /// bounded by [`IDENTITY_POOL_BUILD_TIMEOUT`] — left unbounded, a slow or unreachable
-    /// backend would hang the query indefinitely instead of failing it.
-    ///
-    /// Concurrent cache misses for the *same* key are single-flighted through
-    /// `scoped_pool_build_locks`: only the first caller actually builds; the rest wait on the
-    /// per-key lock and then hit the now-populated cache. Without this, a burst of queries for
-    /// one scope would each build (and all but one immediately discard) a real connection —
-    /// wasted validation calls, not just wasted CPU. `scoped_pool_build_semaphore` additionally
-    /// caps concurrent builds *across* distinct keys, since a timed-out build's
-    /// `spawn_blocking` task keeps running rather than being cancelled (see
-    /// `IDENTITY_POOL_MAX_CONCURRENT_BUILDS`).
-    ///
-    /// Sweeps idle entries at the *start* of every call, before the cache-hit check —
-    /// sweeping only on the (rarer, in steady state) miss path would let an expired pool
-    /// stay reachable indefinitely as long as it kept getting cache hits.
+    /// Cache mutations serialize capacity enforcement. Pool creation and eviction
+    /// run on blocking workers because driver FFI can perform network I/O.
+    /// Per-key weak locks single-flight builds; sweeps prune cancelled build keys.
+    /// A background reaper expires unused pools even without queries.
     async fn scoped_pool_for(&self, key: PoolScopeKey) -> Result<AdbcPool> {
-        let now = std::time::Instant::now();
-        // Count evictions inside the `retain` closure, not via a before/after `len()` diff —
-        // `scoped_pool_for` runs concurrently for different keys, so another task can insert
-        // between the `len()` read and `retain()` finishing, making `before < after` and
-        // underflowing an unsigned subtraction (panics in debug, wraps to a meaningless value
-        // in release).
-        let mut evicted = 0usize;
-        self.scoped_pools.retain(|_, e| {
-            let keep = now.duration_since(e.last_used) < IDENTITY_POOL_IDLE_TTL;
-            if !keep {
-                evicted += 1;
-            }
-            keep
-        });
-        if evicted > 0 {
-            tracing::debug!(
-                cluster = %self.cluster_name,
-                evicted,
-                remaining = self.scoped_pools.len(),
-                "evicted idle ADBC scoped sub-pools"
-            );
+        self.scoped_pools.start_reaper();
+        if let Some(pool) = self.scoped_pools.get(&key) {
+            return Ok(pool);
         }
 
-        if let Some(mut entry) = self.scoped_pools.get_mut(&key) {
-            entry.last_used = now;
-            return Ok(entry.pool.clone());
-        }
-
-        let lock = self
-            .scoped_pool_build_locks
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.scoped_pools.build_lock(&key);
         let _build_guard = lock.lock().await;
-
-        // Re-check: another waiter may have just finished building this key's pool while
-        // we were waiting for the lock.
-        if let Some(mut entry) = self.scoped_pools.get_mut(&key) {
-            entry.last_used = std::time::Instant::now();
-            self.scoped_pool_build_locks.remove(&key);
-            return Ok(entry.pool.clone());
+        if let Some(pool) = self.scoped_pools.get(&key) {
+            return Ok(pool);
         }
 
         let permit = self
@@ -981,41 +939,21 @@ impl AdbcAdapter {
             })
             .and_then(|built| built);
 
-        // Populate the cache (on success) *before* releasing the single-flight lock, so a
-        // brand-new caller that arrives right after the lock is released is guaranteed to
-        // see the cache hit rather than racing to start a redundant build. Release the lock
-        // regardless of outcome — a build failure must not wedge every subsequent attempt
-        // for this key behind a lock nobody will ever release again (the `Arc<Mutex>`
-        // itself is dropped along with the map entry once every clone — including whichever
-        // waiters are still parked on `.lock().await` — has released it).
+        // Publish before releasing the per-key lock. Evicted pools are dropped
+        // outside the cache mutex and away from the async runtime workers.
         match &result {
             Ok(pool) => {
-                // Enforce the hard cap *before* inserting the new entry, not instead of
-                // inserting it — a newly-built pool that was just paid for (a real driver FFI
-                // call) is always kept; if the cache is already at capacity, the
-                // least-recently-used *other* entry is evicted to make room instead.
-                if self.scoped_pools.len() >= SCOPED_POOL_MAX_ENTRIES {
-                    if let Some(lru_key) = self
-                        .scoped_pools
-                        .iter()
-                        .min_by_key(|e| e.last_used)
-                        .map(|e| e.key().clone())
-                    {
-                        self.scoped_pools.remove(&lru_key);
-                        tracing::warn!(
-                            cluster = %self.cluster_name,
-                            cap = SCOPED_POOL_MAX_ENTRIES,
-                            "ADBC scoped sub-pool cache at capacity — evicted least-recently-used entry"
-                        );
-                    }
-                }
-                self.scoped_pools.insert(
-                    key.clone(),
-                    ScopedPoolEntry {
-                        pool: pool.clone(),
-                        last_used: std::time::Instant::now(),
-                    },
-                );
+                let cache = self.scoped_pools.clone();
+                let cache_key = key.clone();
+                let cached_pool = pool.clone();
+                tokio::task::spawn_blocking(move || cache.insert(cache_key, cached_pool))
+                    .await
+                    .map_err(|e| {
+                        QueryFluxError::Engine(format!(
+                            "cluster '{}': scoped pool cache task failed: {e}",
+                            self.cluster_name.0
+                        ))
+                    })?;
                 tracing::info!(
                     cluster = %self.cluster_name,
                     has_token = key.token.is_some(),
@@ -1033,7 +971,6 @@ impl AdbcAdapter {
                 );
             }
         }
-        self.scoped_pool_build_locks.remove(&key);
 
         result
     }
@@ -1110,6 +1047,22 @@ impl AdbcAdapter {
                     field_type: FieldType::Number,
                     required: false,
                     example: Some("4"),
+                },
+                ConfigField {
+                    key: "scopedPoolIdleTimeoutSecs",
+                    label: "Scoped Pool Idle Timeout (seconds)",
+                    description: "Positive idle timeout for identity/session sub-pools. Defaults to 900 seconds.",
+                    field_type: FieldType::Number,
+                    required: false,
+                    example: Some("900"),
+                },
+                ConfigField {
+                    key: "scopedPoolMaxCount",
+                    label: "Maximum Scoped Pools",
+                    description: "Positive maximum cached sub-pool count per cluster; evicts least recently used. Defaults to 500.",
+                    field_type: FieldType::Number,
+                    required: false,
+                    example: Some("500"),
                 },
             ],
         }
@@ -2239,6 +2192,44 @@ mod tests {
         });
         let cfg = AdbcConfig::from_json(&json, "c").expect("parse");
         assert_eq!(cfg.pool_size, 4);
+    }
+
+    #[test]
+    fn scoped_pool_limits_defaults_and_overrides() {
+        let base = serde_json::json!({"driver": "snowflake", "uri": "snowflake://account"});
+        let defaults = AdbcConfig::from_json(&base, "test").unwrap();
+        assert_eq!(defaults.scoped_pool_idle_timeout_secs, 900);
+        assert_eq!(defaults.scoped_pool_max_count, 500);
+        let mut json = base;
+        json["scopedPoolIdleTimeoutSecs"] = serde_json::json!(60);
+        json["scopedPoolMaxCount"] = serde_json::json!(10);
+        let custom = AdbcConfig::from_json(&json, "test").unwrap();
+        assert_eq!(custom.scoped_pool_idle_timeout_secs, 60);
+        assert_eq!(custom.scoped_pool_max_count, 10);
+    }
+
+    #[test]
+    fn scoped_pool_limits_reject_invalid_values() {
+        for field in ["scopedPoolIdleTimeoutSecs", "scopedPoolMaxCount"] {
+            for value in [
+                serde_json::json!(0),
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!("60"),
+                serde_json::json!(null),
+                serde_json::json!(true),
+                serde_json::json!(1e30),
+            ] {
+                let mut json =
+                    serde_json::json!({"driver": "snowflake", "uri": "snowflake://account"});
+                json[field] = value;
+                let error = AdbcConfig::from_json(&json, "test")
+                    .err()
+                    .unwrap()
+                    .to_string();
+                assert!(error.contains(field), "{error}");
+            }
+        }
     }
 
     #[test]

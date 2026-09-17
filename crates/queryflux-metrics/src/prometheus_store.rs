@@ -65,6 +65,7 @@ impl PrometheusMetrics {
         tags_deny_list: Vec<String>,
     ) -> std::result::Result<Self, prometheus::Error> {
         let registry = Registry::new();
+        crate::adbc::register(&registry)?;
 
         let queries_total = CounterVec::new(
             Opts::new("queryflux_queries_total", "Total completed queries"),

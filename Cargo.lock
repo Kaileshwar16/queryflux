@@ -5342,6 +5342,7 @@ dependencies = [
  "mysql_async",
  "queryflux-auth",
  "queryflux-core",
+ "queryflux-metrics",
  "r2d2",
  "r2d2_adbc",
  "rand 0.8.5",
