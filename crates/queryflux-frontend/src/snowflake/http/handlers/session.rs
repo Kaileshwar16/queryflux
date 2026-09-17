@@ -96,6 +96,16 @@ pub async fn login_request(
 
     // Resolve routing group at login time — stored in session so every subsequent
     // query in this session lands on the same cluster group.
+    let mut extra = HashMap::new();
+    if let Some(role) = &role {
+        extra.insert("snowflake.role".to_string(), role.clone());
+    }
+    if let Some(warehouse) = &warehouse {
+        extra.insert("snowflake.warehouse".to_string(), warehouse.clone());
+    }
+    if let Some(schema) = schema.as_ref().filter(|s| !s.is_empty()) {
+        extra.insert("snowflake.schema".to_string(), schema.clone());
+    }
     let session_ctx = SessionContext {
         user: Some(auth_ctx.user.clone()),
         // Map Snowflake database.schema.table onto catalog.database.table,
@@ -103,7 +113,7 @@ pub async fn login_request(
         database: schema.clone().filter(|s| !s.is_empty()),
         catalog: database.clone(),
         tags: QueryTags::default(),
-        extra: Default::default(),
+        extra,
         agent_context: None,
     };
     let routing_result = {

@@ -729,6 +729,15 @@ mod session_schema {
     }
 
     async fn login(h: &WireTestHarness, schema: Option<&str>) -> SnowflakeWireClient {
+        login_with_options(h, schema, Some("ANALYST"), Some("ANALYTICS_WH")).await
+    }
+
+    async fn login_with_options(
+        h: &WireTestHarness,
+        schema: Option<&str>,
+        role: Option<&str>,
+        warehouse: Option<&str>,
+    ) -> SnowflakeWireClient {
         let mut data = json!({
             "LOGIN_NAME": "testuser",
             "DATABASE_NAME": "REPORTING"
@@ -736,9 +745,13 @@ mod session_schema {
         if let Some(schema) = schema {
             data["SCHEMA_NAME"] = json!(schema);
         }
+        let query_params: Vec<_> = [("roleName", role), ("warehouse", warehouse)]
+            .into_iter()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect();
         let response: serde_json::Value = reqwest::Client::new()
             .post(format!("{}/session/v1/login-request", h.base_url()))
-            .query(&[("roleName", "ANALYST"), ("warehouse", "ANALYTICS_WH")])
+            .query(&query_params)
             .json(&json!({"data": data}))
             .send()
             .await
@@ -752,10 +765,13 @@ mod session_schema {
             response["data"]["sessionInfo"]["schemaName"],
             schema.unwrap_or_default()
         );
-        assert_eq!(response["data"]["sessionInfo"]["roleName"], "ANALYST");
+        assert_eq!(
+            response["data"]["sessionInfo"]["roleName"],
+            role.filter(|s| !s.is_empty()).unwrap_or("PUBLIC")
+        );
         assert_eq!(
             response["data"]["sessionInfo"]["warehouseName"],
-            "ANALYTICS_WH"
+            warehouse.unwrap_or_default()
         );
         let mut client = SnowflakeWireClient::new(&h.base_url());
         client.session_token = Some(
@@ -768,15 +784,56 @@ mod session_schema {
     }
 
     #[tokio::test]
-    async fn login_schema_reaches_routing_context() {
+    async fn login_metadata_reaches_routing_context() {
         let h = WireTestHarness::new(0, 0).await.expect("harness");
         let observed = observe(&h).await;
-        let mut client = login(&h, Some("ANALYTICS")).await;
-        let sessions = observed.login.lock().unwrap().clone();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].catalog(), Some("REPORTING"));
-        assert_eq!(sessions[0].database(), Some("ANALYTICS"));
-        client.logout().await.expect("logout");
+        for (schema, role, warehouse) in [
+            ("ANALYTICS", "ANALYST", "ANALYTICS_WH"),
+            (" Analytics ", " Analyst ", " Analytics_Wh "),
+            (" ", " ", " "),
+        ] {
+            observed.login.lock().unwrap().clear();
+            let mut client =
+                login_with_options(&h, Some(schema), Some(role), Some(warehouse)).await;
+            let sessions = observed.login.lock().unwrap().clone();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].catalog(), Some("REPORTING"));
+            assert_eq!(sessions[0].database(), Some(schema));
+            for (key, value) in [
+                ("snowflake.role", role),
+                ("snowflake.warehouse", warehouse),
+                ("snowflake.schema", schema),
+            ] {
+                assert_eq!(
+                    sessions[0].extra.get(key).map(String::as_str),
+                    Some(value),
+                    "{key}"
+                );
+            }
+            client.logout().await.expect("logout");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_missing_or_empty_metadata_is_absent_from_routing_context() {
+        let h = WireTestHarness::new(0, 0).await.expect("harness");
+        let observed = observe(&h).await;
+        for schema in [None, Some("")] {
+            for role in [None, Some("")] {
+                for warehouse in [None, Some("")] {
+                    observed.login.lock().unwrap().clear();
+                    let mut client = login_with_options(&h, schema, role, warehouse).await;
+                    let sessions = observed.login.lock().unwrap().clone();
+                    assert_eq!(sessions.len(), 1);
+                    assert_eq!(sessions[0].catalog(), Some("REPORTING"));
+                    assert_eq!(sessions[0].database(), None);
+                    for key in ["snowflake.role", "snowflake.warehouse", "snowflake.schema"] {
+                        assert!(!sessions[0].extra.contains_key(key), "{key}");
+                    }
+                    client.logout().await.expect("logout");
+                }
+            }
+        }
     }
 
     #[tokio::test]
