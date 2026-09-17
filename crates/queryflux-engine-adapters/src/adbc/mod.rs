@@ -34,7 +34,9 @@ mod sql_helpers;
 mod test_fixtures;
 
 use introspection::AdbcIntrospection;
-use scoped_pools::{ScopedPools, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_COUNT};
+use scoped_pools::{
+    spawn_with_build_guard, ScopedPools, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_COUNT,
+};
 
 const DEFAULT_POOL_SIZE: u32 = 4;
 
@@ -870,7 +872,7 @@ impl AdbcAdapter {
         }
 
         let lock = self.scoped_pools.build_lock(&key);
-        let _build_guard = lock.lock().await;
+        let build_guard = lock.lock_owned().await;
         if let Some(pool) = self.scoped_pools.get(&key) {
             return Ok(pool);
         }
@@ -892,7 +894,7 @@ impl AdbcAdapter {
         let max_size = self.scoped_pool_size(&key);
         let key_for_build = key.clone();
 
-        let build = tokio::task::spawn_blocking(move || -> Result<AdbcPool> {
+        let build = spawn_with_build_guard(build_guard, move || -> Result<AdbcPool> {
             let _permit = permit;
             let opts = Self::scoped_pool_options(&driver_name, &key_for_build)?;
             let mut opts_with_uri = vec![(OptionDatabase::Uri, base_uri.into())];
@@ -937,23 +939,27 @@ impl AdbcAdapter {
                     ))
                 })
             })
-            .and_then(|built| built);
+            .and_then(|(built, guard)| built.map(|pool| (pool, guard)));
 
         // Publish before releasing the per-key lock. Evicted pools are dropped
         // outside the cache mutex and away from the async runtime workers.
-        match &result {
-            Ok(pool) => {
+        match result {
+            Ok((pool, build_guard)) => {
                 let cache = self.scoped_pools.clone();
                 let cache_key = key.clone();
                 let cached_pool = pool.clone();
-                tokio::task::spawn_blocking(move || cache.insert(cache_key, cached_pool))
-                    .await
-                    .map_err(|e| {
-                        QueryFluxError::Engine(format!(
-                            "cluster '{}': scoped pool cache task failed: {e}",
-                            self.cluster_name.0
-                        ))
-                    })?;
+                // The insertion worker must also own the guard: cancelling the
+                // request here must not allow another build before publication.
+                let (_, _build_guard) = spawn_with_build_guard(build_guard, move || {
+                    cache.insert(cache_key, cached_pool)
+                })
+                .await
+                .map_err(|e| {
+                    QueryFluxError::Engine(format!(
+                        "cluster '{}': scoped pool cache task failed: {e}",
+                        self.cluster_name.0
+                    ))
+                })?;
                 tracing::info!(
                     cluster = %self.cluster_name,
                     has_token = key.token.is_some(),
@@ -962,6 +968,7 @@ impl AdbcAdapter {
                     schema = ?key.schema,
                     "built ADBC scoped sub-pool"
                 );
+                Ok(pool)
             }
             Err(e) => {
                 tracing::warn!(
@@ -969,10 +976,9 @@ impl AdbcAdapter {
                     error = %e,
                     "failed to build ADBC scoped sub-pool"
                 );
+                Err(e)
             }
         }
-
-        result
     }
 
     pub fn descriptor() -> EngineDescriptor {

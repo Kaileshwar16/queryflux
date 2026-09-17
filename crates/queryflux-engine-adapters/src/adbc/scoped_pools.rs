@@ -12,6 +12,18 @@ use super::PoolScopeKey;
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 pub const DEFAULT_MAX_COUNT: usize = 500;
 
+/// Keep single-flight ownership with blocking work even if its caller times out
+/// or is cancelled. Returning the guard lets the caller retain it until publish.
+pub(super) fn spawn_with_build_guard<T: Send + 'static>(
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> tokio::task::JoinHandle<(T, tokio::sync::OwnedMutexGuard<()>)> {
+    tokio::task::spawn_blocking(move || {
+        let result = work();
+        (result, guard)
+    })
+}
+
 struct Entry<M: ManageConnection> {
     pool: Pool<M>,
     last_used: Instant,
@@ -359,6 +371,85 @@ mod tests {
         drop(waiter);
         cache.sweep();
         assert!(cache.state.lock().unwrap().builds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timed_out_build_holds_scope_lock_until_worker_finishes() {
+        let cache = cache("timed-out-build", 2);
+        let guard = cache.build_lock(&key("a")).lock_owned().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let build = spawn_with_build_guard(guard, move || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        started_rx.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(10), build)
+            .await
+            .is_err());
+
+        // Pruning weak entries must not create a new lock for the running build.
+        cache.sweep();
+        let same_scope = cache.build_lock(&key("a"));
+        assert!(same_scope.try_lock().is_err());
+        assert!(cache.build_lock(&key("b")).try_lock().is_ok());
+        finish_tx.send(()).unwrap();
+        let guard = tokio::time::timeout(Duration::from_secs(2), same_scope.lock_owned())
+            .await
+            .unwrap();
+        drop(guard);
+        cache.sweep();
+        assert!(cache.state.lock().unwrap().builds.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_publication_keeps_guard_until_pool_is_cached() {
+        let cache = Arc::new(cache("cancelled-publication", 2));
+        let guard = cache.build_lock(&key("a")).lock_owned().await;
+        let (built_pool, _) = pool();
+        let (built_pool, guard) = spawn_with_build_guard(guard, move || built_pool)
+            .await
+            .unwrap();
+        assert!(cache.build_lock(&key("a")).try_lock().is_err());
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let cache_for_insert = cache.clone();
+        let insertion = spawn_with_build_guard(guard, move || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            cache_for_insert.insert(key("a"), built_pool);
+        });
+        started_rx.await.unwrap();
+        drop(insertion); // A cancelled request drops its JoinHandle the same way.
+        assert!(cache.build_lock(&key("a")).try_lock().is_err());
+        finish_tx.send(()).unwrap();
+        let _guard = tokio::time::timeout(
+            Duration::from_secs(2),
+            cache.build_lock(&key("a")).lock_owned(),
+        )
+        .await
+        .unwrap();
+        assert!(cache.get(&key("a")).is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_or_panicking_build_releases_scope_lock() {
+        let cache = cache("failed-build", 2);
+        let guard = cache.build_lock(&key("a")).lock_owned().await;
+        let (result, guard) = spawn_with_build_guard(guard, || Err::<(), _>("build failed"))
+            .await
+            .unwrap();
+        assert!(result.is_err());
+        drop(guard);
+        assert!(cache.build_lock(&key("a")).try_lock().is_ok());
+
+        let guard = cache.build_lock(&key("a")).lock_owned().await;
+        assert!(spawn_with_build_guard(guard, || panic!("driver panic"))
+            .await
+            .unwrap_err()
+            .is_panic());
+        assert!(cache.build_lock(&key("a")).try_lock().is_ok());
     }
 
     #[test]
