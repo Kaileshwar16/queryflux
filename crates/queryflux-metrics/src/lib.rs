@@ -1,3 +1,4 @@
+pub mod adbc;
 pub mod buffered_store;
 pub mod prometheus_store;
 
