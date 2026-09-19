@@ -7,7 +7,7 @@ static POOLS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     IntGaugeVec::new(
         Opts::new(
             "queryflux_adbc_scoped_pools",
-            "Cached ADBC scoped sub-pools",
+            "Cached ADBC scoped sub-pools, including expired entries awaiting cleanup",
         ),
         &["cluster_group", "cluster_name"],
     )

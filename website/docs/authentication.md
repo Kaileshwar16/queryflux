@@ -139,6 +139,12 @@ Prometheus `/metrics` exposes `queryflux_adbc_scoped_pools` (cached pool count) 
 and `cluster_name` labels; the counter also has `reason="idle"` or `reason="lru"`.
 No identity, password, or token is included in metric labels. The gauge includes
 both adapter generations while a config reload drains the old adapter.
+Expired scopes remain in the gauge until the next background sweep or pool
+insertion removes them, even if a lookup has already rejected them as expired.
+Allow for this cleanup delay when alerting on the gauge: the background task waits
+`min(scopedPoolIdleTimeoutSecs, 60)` seconds between sweeps, with additional delay
+possible from worker scheduling and cleanup. Connection cleanup runs on blocking
+workers because driver release callbacks can involve network I/O.
 
 ---
 

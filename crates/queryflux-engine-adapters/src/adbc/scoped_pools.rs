@@ -91,6 +91,7 @@ impl<M: ManageConnection> ScopedPools<M> {
         let entry = state.entries.get_mut(key)?;
         // Do not revive expired entries between background sweeps. Their
         // destruction is deferred to insert/sweep on a blocking worker.
+        // The cached-pool gauge includes them until that cleanup removes them.
         if now.duration_since(entry.last_used) >= self.idle_timeout {
             return None;
         }
