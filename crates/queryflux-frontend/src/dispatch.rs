@@ -3072,7 +3072,6 @@ mod translation_policy_tests {
                 &AuthContext::default(),
             )
             .await
-            .ok()
             .expect("access-controlled execution setup");
             assert!(
                 setup.translated.contains("tenant_id = 42"),
@@ -3255,7 +3254,6 @@ mod translation_policy_tests {
                 &auth,
             )
             .await
-            .ok()
             .expect("compatible request after strict rejection");
             assert_eq!(
                 next.ctx.translation,
@@ -3290,7 +3288,6 @@ mod translation_policy_tests {
                 &AuthContext::default(),
             )
             .await
-            .ok()
             .expect("execution setup should succeed");
             assert_eq!(setup.translated, "select 1");
             assert_eq!(
