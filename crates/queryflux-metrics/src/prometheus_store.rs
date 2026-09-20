@@ -67,6 +67,7 @@ impl PrometheusMetrics {
         tags_deny_list: Vec<String>,
     ) -> std::result::Result<Self, prometheus::Error> {
         let registry = Registry::new();
+        crate::adbc::register(&registry)?;
         let translation_skipped_total = CounterVec::new(
             Opts::new(
                 "queryflux_translation_skipped_total",

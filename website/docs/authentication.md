@@ -110,6 +110,42 @@ Backend identity needs a small amount of setup on the engine side — QueryFlux 
 
 Full per-engine wiring, the resolver's fail-closed contract, and the `queryAuth` × engine compatibility matrix: **[Auth & authorization design](/docs/architecture/auth-authz-design)**.
 
+### ADBC scoped connection pools
+
+ADBC isolates `tokenExchange` and Snowflake `passthrough` credentials in separate
+connection sub-pools. Snowflake session overrides (`USE ROLE`, `USE WAREHOUSE`,
+`USE SCHEMA`) also create separate scopes when they differ from the cluster config.
+These pools share a per-cluster cache with the following optional **ADBC cluster
+config** fields (admin API/UI, alongside `driver`, `uri`, and `poolSize`):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `scopedPoolIdleTimeoutSecs` | `900` | Seconds since the last pool lookup before a cached scope expires. |
+| `scopedPoolMaxCount` | `500` | Maximum cached scopes per cluster per process; evicts the least recently used scope at capacity. |
+
+Both values must be positive integers. The limits cover identity and session-override
+scopes together; the base service-account pool is separate. Identity scopes have at
+most two connections each; scopes containing only session overrides use `poolSize`.
+
+A background task sweeps expired scopes every `min(scopedPoolIdleTimeoutSecs, 60)`
+seconds, including when no queries arrive. Expired scopes are not reused between
+sweeps. Eviction drops the cache's pool reference, allowing r2d2 and the ADBC driver
+to release connections and backend sessions. In-flight queries retain their pools
+until completion, so eviction does not interrupt them; retained pools and builds
+in progress can temporarily exceed the cache count limit.
+
+Prometheus `/metrics` exposes `queryflux_adbc_scoped_pools` (cached pool count) and
+`queryflux_adbc_scoped_pool_evictions_total` (counter). Both have `cluster_group`
+and `cluster_name` labels; the counter also has `reason="idle"` or `reason="lru"`.
+No identity, password, or token is included in metric labels. The gauge includes
+both adapter generations while a config reload drains the old adapter.
+Expired scopes remain in the gauge until the next background sweep or pool
+insertion removes them, even if a lookup has already rejected them as expired.
+Allow for this cleanup delay when alerting on the gauge: the background task waits
+`min(scopedPoolIdleTimeoutSecs, 60)` seconds between sweeps, with additional delay
+possible from worker scheduling and cleanup. Connection cleanup runs on blocking
+workers because driver release callbacks can involve network I/O.
+
 ---
 
 ## Try it

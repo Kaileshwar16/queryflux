@@ -2,7 +2,7 @@ use queryflux_core::{
     config::TranslationMode,
     query::{SqlDialect, TranslationReason, TranslationStatus},
 };
-use queryflux_translation::{SchemaContext, TranslationService};
+use queryflux_translation::{ColumnMap, SchemaContext, TranslationService};
 
 #[tokio::test]
 async fn best_effort_preserves_original_sql_on_transpile_error() {
@@ -113,7 +113,7 @@ async fn schema_outcomes_are_independent_of_text_changes_and_strictness() {
     let schema = SchemaContext {
         tables: std::collections::HashMap::from([(
             "t".into(),
-            std::collections::HashMap::from([("x".into(), "INT".into())]),
+            ColumnMap::from([("x".into(), "INT".into())]),
         )]),
         ..Default::default()
     };
@@ -269,7 +269,7 @@ async fn statement_trivia_survives_schema_translation_and_same_dialect_fixups() 
     let schema = SchemaContext {
         tables: std::collections::HashMap::from([(
             "t".into(),
-            std::collections::HashMap::from([("x".into(), "INT".into())]),
+            ColumnMap::from([("x".into(), "INT".into())]),
         )]),
         ..Default::default()
     };

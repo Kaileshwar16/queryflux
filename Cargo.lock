@@ -5135,6 +5135,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "queryflux-access-control",
  "queryflux-auth",
  "queryflux-cache",
  "queryflux-catalog",
@@ -5156,6 +5157,20 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "queryflux-access-control"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "queryflux-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -5278,6 +5293,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "indexmap 2.13.0",
  "polyglot-sql 0.3.2",
  "serde",
  "serde_json",
@@ -5301,6 +5317,7 @@ dependencies = [
  "futures",
  "mysql_async",
  "prost 0.14.3",
+ "queryflux-access-control",
  "queryflux-auth",
  "queryflux-cache",
  "queryflux-cluster-manager",
@@ -5342,6 +5359,7 @@ dependencies = [
  "mysql_async",
  "queryflux-auth",
  "queryflux-core",
+ "queryflux-metrics",
  "r2d2",
  "r2d2_adbc",
  "rand 0.8.5",
@@ -5383,7 +5401,9 @@ dependencies = [
  "dashmap",
  "flate2",
  "futures",
+ "polyglot-sql 0.3.2",
  "prost 0.14.3",
+ "queryflux-access-control",
  "queryflux-auth",
  "queryflux-cache",
  "queryflux-cluster-manager",
@@ -5482,6 +5502,8 @@ dependencies = [
  "async-trait",
  "pyo3",
  "queryflux-core",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

@@ -84,6 +84,10 @@ pub struct ProxyConfig {
     /// Omit to disable all guardrails.
     #[serde(default)]
     pub guardrails: Option<GuardrailsConfig>,
+    /// Data-level access control (OPA row filtering, column masking, table/column
+    /// allow-deny). Omit to disable.
+    #[serde(default)]
+    pub access_control: Option<crate::access_config::AccessControlConfig>,
 }
 
 impl ProxyConfig {
@@ -93,6 +97,9 @@ impl ProxyConfig {
         self.authorization.validate()?;
         if let Some(guardrails) = &self.guardrails {
             guardrails.validate()?;
+        }
+        if let Some(access_control) = &self.access_control {
+            access_control.validate()?;
         }
         Ok(())
     }
@@ -1148,9 +1155,11 @@ pub struct ClusterConfig {
     /// On timeout the proxy calls `StopQueryExecution`.
     #[serde(default)]
     pub max_wait_secs: Option<u64>,
-    /// Max bytes of a single query result QueryFlux buffers in memory
-    /// (`maxResultBufferBytes` in JSON/YAML). ClickHouse only; defaults to
-    /// 1 GiB when omitted. Other engines ignore this.
+    /// Max bytes of buffered query data (`maxResultBufferBytes` in JSON/YAML).
+    /// For ClickHouse Arrow results, this guards bytes consumed between decoded
+    /// batches while the complete result streams. ClickHouse control-plane TSV
+    /// reads and DuckDB buffered results still cap the entire response.
+    /// ClickHouse and DuckDB default to 1 GiB when omitted; other adapters ignore this.
     #[serde(default)]
     pub max_result_buffer_bytes: Option<u64>,
     /// ADBC driver name (e.g. `"snowflake"`, `"flightsql"`) — only meaningful when

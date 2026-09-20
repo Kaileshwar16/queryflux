@@ -79,6 +79,9 @@ pub const GROUP_DUCKDB: &str = "duckdb";
 /// Set when Lakekeeper port is reachable (Iceberg tables seeded by e2e tests via Trino).
 pub const GROUP_LAKEKEEPER: &str = "lakekeeper";
 pub const GROUP_CLICKHOUSE: &str = "clickhouse";
+/// Small enough that ClickHouse E2E tests can prove multi-batch results are not
+/// rejected based on total response size, while still allowing ordinary blocks.
+pub const CLICKHOUSE_TEST_RESULT_BUFFER_BYTES: usize = 1 << 18;
 
 pub struct TestHarness {
     pub port: u16,
@@ -237,8 +240,7 @@ impl TestHarness {
                         endpoint: ch_url,
                         auth: None,
                         tls_skip_verify: false,
-                        max_result_buffer_bytes:
-                            queryflux_engine_adapters::clickhouse::DEFAULT_MAX_RESULT_BUFFER_BYTES,
+                        max_result_buffer_bytes: CLICKHOUSE_TEST_RESULT_BUFFER_BYTES,
                     },
                 )
                 .map_err(|e| anyhow!("ClickHouse adapter: {e}"))?,
@@ -341,6 +343,7 @@ impl TestHarness {
             router_chain,
             guard_chain: None,
             group_guard_chains: HashMap::new(),
+            access_control_guard: None,
             cluster_manager,
             adapters,
             health_check_targets: vec![],
@@ -591,6 +594,7 @@ impl WireTestHarness {
             router_chain,
             guard_chain: None,
             group_guard_chains: HashMap::new(),
+            access_control_guard: None,
             cluster_manager,
             adapters,
             health_check_targets: vec![],
@@ -735,6 +739,7 @@ impl WireTestHarness {
             router_chain,
             guard_chain: None,
             group_guard_chains: HashMap::new(),
+            access_control_guard: None,
             cluster_manager,
             adapters,
             health_check_targets: vec![],
@@ -848,6 +853,25 @@ impl ProtocolWireHarness {
     pub async fn new_with_guard_chain(
         guard_chain: Option<Arc<queryflux_guardrails::GuardChain>>,
     ) -> Result<Self> {
+        Self::build(guard_chain, None, 2).await
+    }
+
+    /// Same as `new()`, but installs `access_control_guard` as the pre-translation
+    /// access-control guard — lets tests exercise OPA-backed row filtering / column
+    /// masking / table-column allow-deny end-to-end through a real frontend. Uses a
+    /// single-connection DuckDB pool so `CREATE TABLE` / `INSERT` / `SELECT` in the same
+    /// test see consistent state (DuckDB's `:memory:` is per-connection, not shared).
+    pub async fn new_with_access_control(
+        access_control_guard: Option<Arc<queryflux_frontend::access_control_guard::OpaAccessGuard>>,
+    ) -> Result<Self> {
+        Self::build(None, access_control_guard, 1).await
+    }
+
+    async fn build(
+        guard_chain: Option<Arc<queryflux_guardrails::GuardChain>>,
+        access_control_guard: Option<Arc<queryflux_frontend::access_control_guard::OpaAccessGuard>>,
+        pool_size: usize,
+    ) -> Result<Self> {
         let _ = tracing_subscriber::fmt()
             .with_env_filter("error")
             .try_init();
@@ -871,7 +895,7 @@ impl ProtocolWireHarness {
                 DuckDbConfig {
                     database_path: None,
                     motherduck_token: None,
-                    pool_size: 2,
+                    pool_size,
                     max_result_buffer_bytes: DEFAULT_MAX_RESULT_BUFFER_BYTES,
                 },
             )
@@ -906,6 +930,7 @@ impl ProtocolWireHarness {
             router_chain,
             guard_chain,
             group_guard_chains: HashMap::new(),
+            access_control_guard,
             cluster_manager,
             adapters,
             health_check_targets: vec![],

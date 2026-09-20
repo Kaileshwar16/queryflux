@@ -90,6 +90,13 @@ fn record_translation(
 /// calling `maybe_translate` entirely: no dialect is passed to sqlglot, and no configured
 /// fixup scripts run either, since those need a real dialect to parse under too. The SQL
 /// passes through completely unmodified.
+/// Whether the table schema should be looked up for this query: translation needs it, and so
+/// does access control (without it every table reads as "all columns"), which must not depend
+/// on whether a source dialect was declared.
+fn should_resolve_schema(attempt_translation: bool, access_control_enabled: bool) -> bool {
+    attempt_translation || access_control_enabled
+}
+
 fn should_attempt_translation(session: &SessionContext, protocol: &FrontendProtocol) -> bool {
     !matches!(protocol, FrontendProtocol::Mcp) || session.extra.contains_key("dialect")
 }
@@ -205,6 +212,7 @@ pub async fn dispatch_query(
         group_default_tags,
         guard_chain,
         group_guard_chain,
+        access_control_guard,
         cluster_cfg,
         adapters,
         max_queued_queries,
@@ -224,6 +232,7 @@ pub async fn dispatch_query(
                 .unwrap_or_default(),
             live.guard_chain.clone(),
             live.group_guard_chains.get(&group.0).cloned(),
+            live.access_control_guard.clone(),
             // cluster_cfg resolved after cluster selection below; captured here
             // so credential resolution uses the same config generation.
             live.cluster_configs.clone(),
@@ -250,6 +259,9 @@ pub async fn dispatch_query(
     }
 
     let effective_tags = merge_tags(&group_default_tags, &session.tags().clone());
+    // Computed here (before translation) so the access-control stage below and the
+    // guard chain further down share one resolution.
+    let resolved_agent_ctx = session.resolved_agent_context();
 
     // Admission fairness: don't take a slot that an older, actively-polling
     // queued query is waiting for. Only binds when capacity is scarce — with
@@ -391,18 +403,99 @@ pub async fn dispatch_query(
     let src_dialect = resolve_src_dialect(&session, &protocol);
     let engine_type = adapter_kind.engine_type();
     let original_sql = sql.clone();
+    let attempt_translation = should_attempt_translation(&session, &protocol);
+    let schema_context =
+        if should_resolve_schema(attempt_translation, access_control_guard.is_some()) {
+            state
+                .translation
+                .resolve_schema_context(
+                    &sql,
+                    &src_dialect,
+                    &catalog,
+                    session.catalog(),
+                    session.database(),
+                )
+                .await
+        } else {
+            Default::default()
+        };
+
+    // Access control: runs on the SOURCE SQL, before dialect translation — every guard
+    // decision (including row filters / column masks) is intent-level and answerable from
+    // what the client actually sent. See `access_control_guard::run_access_control_stage`.
+    let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+    let sql = if let Some(guard) = &access_control_guard {
+        use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
+        match run_access_control_stage(
+            guard,
+            &sql,
+            &src_dialect,
+            &engine_type,
+            &group,
+            auth_ctx,
+            &session,
+            Some(&schema_context),
+            &effective_tags,
+        )
+        .await
+        {
+            AccessStageOutcome::Allowed { action } => {
+                all_guard_actions.push(action);
+                sql
+            }
+            AccessStageOutcome::Rewritten {
+                sql: rewritten,
+                action,
+            } => {
+                all_guard_actions.push(action);
+                rewritten
+            }
+            AccessStageOutcome::Denied { reason, action, .. } => {
+                let ctx = QueryContext {
+                    query_id: query_id.clone(),
+                    sql: original_sql.clone(),
+                    session: session.clone(),
+                    protocol: protocol.clone(),
+                    group: group.clone(),
+                    cluster: cluster_name.clone(),
+                    cluster_group_config_id,
+                    cluster_config_id,
+                    engine_type: engine_type.clone(),
+                    src_dialect: src_dialect.clone(),
+                    tgt_dialect: tgt_dialect.clone(),
+                    was_translated: false,
+                    translation: None,
+                    translated_sql: None,
+                    query_tags: effective_tags.clone(),
+                    query_params: vec![],
+                    agent_context: resolved_agent_ctx.clone(),
+                };
+                state.record_query(
+                    &ctx,
+                    QueryOutcome {
+                        backend_query_id: None,
+                        status: QueryStatus::Denied,
+                        execution_ms: 0,
+                        rows: None,
+                        error: Some(reason.clone()),
+                        routing_trace: None,
+                        engine_stats: None,
+                        guard_actions: vec![action],
+                        was_guard_blocked: true,
+                        queue_duration_ms: 0,
+                        cache_hit: false,
+                    },
+                );
+                slot.release().await;
+                return Err(QueryFluxError::Unauthorized(reason));
+            }
+        }
+    } else {
+        sql
+    };
+
     let mut translation_outcome = queryflux_core::query::TranslationOutcome::not_needed();
-    let sql = if should_attempt_translation(&session, &protocol) {
-        let schema_context = state
-            .translation
-            .resolve_schema_context(
-                &sql,
-                &src_dialect,
-                &catalog,
-                session.catalog(),
-                session.database(),
-            )
-            .await;
+    let sql = if attempt_translation {
         let report = state
             .translation
             .maybe_translate_report(
@@ -447,7 +540,7 @@ pub async fn dispatch_query(
                         error: Some(e.to_string()),
                         routing_trace: None,
                         engine_stats: None,
-                        guard_actions: vec![],
+                        guard_actions: all_guard_actions,
                         was_guard_blocked: false,
                         queue_duration_ms,
                         cache_hit: false,
@@ -482,8 +575,6 @@ pub async fn dispatch_query(
 
     // Guard chain: runs after translation (SQL is final), before engine submission.
     // Global guards run first; per-group guards are appended after.
-    let resolved_agent_ctx = session.resolved_agent_context();
-    let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
     let sql_parse =
         queryflux_core::sql_classify::SqlParseCache::new(sql.clone(), tgt_dialect.clone());
 
@@ -1372,7 +1463,14 @@ async fn setup_sync_query(
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
-    let (cluster_manager, group_fixups, group_default_tags, wait_timeout_secs, catalog) = {
+    let (
+        cluster_manager,
+        group_fixups,
+        group_default_tags,
+        wait_timeout_secs,
+        catalog,
+        access_control_guard,
+    ) = {
         let live = state.live.read().await;
         let wait_timeout_secs = live
             .group_capacity_wait_timeout_secs
@@ -1391,6 +1489,7 @@ async fn setup_sync_query(
                 .unwrap_or_default(),
             wait_timeout_secs,
             live.catalog.clone(),
+            live.access_control_guard.clone(),
         )
     };
     let effective_tags: QueryTags = merge_tags(&group_default_tags, &session.tags().clone());
@@ -1485,27 +1584,108 @@ async fn setup_sync_query(
     let src_dialect = resolve_src_dialect(&session, &protocol);
     let engine_type = adapter.engine_type();
     let start = Instant::now();
+    let attempt_translation = should_attempt_translation(&session, &protocol);
+
+    let schema_context =
+        if should_resolve_schema(attempt_translation, access_control_guard.is_some()) {
+            state
+                .translation
+                .resolve_schema_context(
+                    &sql,
+                    &src_dialect,
+                    &catalog,
+                    session.catalog(),
+                    session.database(),
+                )
+                .await
+        } else {
+            Default::default()
+        };
+
+    // Access control: runs on the SOURCE SQL, before dialect translation (see the async
+    // dispatch path for the full rationale). On deny: record the query, release the slot,
+    // propagate. On rewrite: `access_controlled_sql` replaces `sql` for translation below.
+    let mut pre_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+    let access_controlled_sql = if let Some(guard) = &access_control_guard {
+        use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
+        match run_access_control_stage(
+            guard,
+            &sql,
+            &src_dialect,
+            &engine_type,
+            &group,
+            auth_ctx,
+            &session,
+            Some(&schema_context),
+            &effective_tags,
+        )
+        .await
+        {
+            AccessStageOutcome::Allowed { action } => {
+                pre_guard_actions.push(action);
+                sql.clone()
+            }
+            AccessStageOutcome::Rewritten {
+                sql: rewritten,
+                action,
+            } => {
+                pre_guard_actions.push(action);
+                rewritten
+            }
+            AccessStageOutcome::Denied { reason, action, .. } => {
+                let ctx = QueryContext {
+                    query_id: query_id.clone(),
+                    sql: sql.clone(),
+                    session: session.clone(),
+                    protocol: protocol.clone(),
+                    group: group.clone(),
+                    cluster: cluster_name.clone(),
+                    cluster_group_config_id,
+                    cluster_config_id,
+                    engine_type: engine_type.clone(),
+                    src_dialect: src_dialect.clone(),
+                    tgt_dialect: tgt_dialect.clone(),
+                    was_translated: false,
+                    translation: None,
+                    translated_sql: None,
+                    query_tags: effective_tags,
+                    query_params: params,
+                    agent_context: session.resolved_agent_context(),
+                };
+                state.record_query(
+                    &ctx,
+                    QueryOutcome {
+                        backend_query_id: None,
+                        status: QueryStatus::Denied,
+                        execution_ms: start.elapsed().as_millis() as u64,
+                        rows: None,
+                        error: Some(reason.clone()),
+                        routing_trace: None,
+                        engine_stats: None,
+                        guard_actions: vec![action],
+                        was_guard_blocked: true,
+                        queue_duration_ms: 0,
+                        cache_hit: false,
+                    },
+                );
+                slot.release().await;
+                return Err(QueryFluxError::Unauthorized(reason));
+            }
+        }
+    } else {
+        sql.clone()
+    };
 
     // Translate SQL. On failure: record the query, release the slot, propagate the error.
     // The caller (execute_to_sink) will notify the sink via on_error. Skipped entirely
     // (sqlglot never invoked) when should_attempt_translation is false — see its doc
     // comment for why MCP without a declared dialect takes this path.
     let mut translation_outcome = queryflux_core::query::TranslationOutcome::not_needed();
-    let translated = if should_attempt_translation(&session, &protocol) {
-        let schema_context = state
-            .translation
-            .resolve_schema_context(
-                &sql,
-                &src_dialect,
-                &catalog,
-                session.catalog(),
-                session.database(),
-            )
-            .await;
+    let translated = if attempt_translation {
         let report = state
             .translation
             .maybe_translate_report(
-                &sql,
+                &access_controlled_sql,
                 &src_dialect,
                 &tgt_dialect,
                 &schema_context,
@@ -1547,7 +1727,7 @@ async fn setup_sync_query(
                         error: Some(err_msg),
                         routing_trace: None,
                         engine_stats: None,
-                        guard_actions: vec![],
+                        guard_actions: pre_guard_actions,
                         was_guard_blocked: false,
                         queue_duration_ms: 0,
                         cache_hit: false,
@@ -1559,7 +1739,7 @@ async fn setup_sync_query(
         }
     } else {
         state.metrics.on_translation(translation_outcome);
-        sql.clone()
+        access_controlled_sql
     };
 
     let was_translated = translated != sql;
@@ -1642,7 +1822,7 @@ async fn setup_sync_query(
         ctx,
         credentials,
         params: effective_params,
-        guard_actions: vec![],
+        guard_actions: pre_guard_actions,
         wire_auth,
     })
 }
@@ -2209,7 +2389,9 @@ async fn execute_to_sink_inner(
             sql_parse: Some(&setup.sql_parse),
         };
 
-        let mut all_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
+        // Start from the access-control action recorded pre-translation (see
+        // `setup_sync_query`) so the audit trail carries the whole pipeline.
+        let mut all_actions: Vec<queryflux_persistence::GuardAction> = setup.guard_actions.clone();
 
         for chain in [guard_chain.as_ref(), group_guard_chain.as_ref()]
             .into_iter()
@@ -2244,8 +2426,8 @@ async fn execute_to_sink_inner(
             }
         }
 
-        // Attach non-blocking guard actions (allow/warn) to the setup context so they
-        // flow into record_query at the normal exit point below.
+        // Attach the combined (pre- + post-translation) guard actions to the setup
+        // context so they flow into record_query at the normal exit point below.
         setup.guard_actions = all_actions;
     }
 
@@ -2631,7 +2813,7 @@ mod resolve_src_dialect_tests {
 
 #[cfg(test)]
 mod should_attempt_translation_tests {
-    use super::should_attempt_translation;
+    use super::{should_attempt_translation, should_resolve_schema};
     use queryflux_core::query::FrontendProtocol;
     use queryflux_core::session::SessionContext;
 
@@ -2642,6 +2824,23 @@ mod should_attempt_translation_tests {
             &session,
             &FrontendProtocol::Mcp
         ));
+    }
+
+    /// MCP with no declared dialect skips translation, but access control still needs the schema.
+    #[test]
+    fn schema_is_resolved_for_access_control_even_without_translation() {
+        let session = SessionContext::default();
+        let translates = should_attempt_translation(&session, &FrontendProtocol::Mcp);
+        assert!(!translates);
+        assert!(
+            should_resolve_schema(translates, true),
+            "access control needs the schema"
+        );
+        assert!(
+            !should_resolve_schema(translates, false),
+            "nothing needs it"
+        );
+        assert!(should_resolve_schema(true, false), "translation needs it");
     }
 
     #[test]
@@ -2677,6 +2876,10 @@ mod should_attempt_translation_tests {
 mod translation_policy_tests {
     use super::*;
     use crate::state::test_fixtures::app_state_with_metrics;
+    use queryflux_access_control::{
+        AccessController, AccessControllerConfig, AccessDecision, AccessRequest,
+        PolicyDecisionProvider, PolicyError,
+    };
     use queryflux_core::config::TranslationMode;
     use queryflux_engine_adapters::trino::{TrinoAdapter, TrinoConfig};
     use queryflux_metrics::{prometheus_store::PrometheusMetrics, MultiMetricsStore};
@@ -2714,6 +2917,181 @@ mod translation_policy_tests {
             ))),
         );
         (state, history, prometheus)
+    }
+
+    struct FixedPolicy(AccessDecision);
+
+    #[async_trait::async_trait]
+    impl PolicyDecisionProvider for FixedPolicy {
+        async fn evaluate(
+            &self,
+            request: &AccessRequest,
+        ) -> std::result::Result<AccessDecision, PolicyError> {
+            assert_eq!(request.resources[0].table, "orders");
+            Ok(self.0.clone())
+        }
+
+        fn name(&self) -> &'static str {
+            "fixed_test_policy"
+        }
+    }
+
+    async fn install_access_policy(state: &AppState, decision: AccessDecision) {
+        let controller =
+            AccessController::new(AccessControllerConfig::new(Arc::new(FixedPolicy(decision))));
+        state.live.write().await.access_control_guard =
+            Some(Arc::new(crate::access_control_guard::OpaAccessGuard::new(
+                Arc::new(controller),
+                vec![],
+                queryflux_core::access_config::OnMissingSchema::Evaluate,
+            )));
+    }
+
+    #[tokio::test]
+    async fn access_control_precedes_strict_translation_and_retains_its_audit() {
+        for async_dispatch in [false, true] {
+            for denied in [false, true] {
+                let (state, history, prometheus) = fixture(TranslationMode::Strict).await;
+                install_access_policy(
+                    &state,
+                    if denied {
+                        AccessDecision::deny_all("test policy denial")
+                    } else {
+                        AccessDecision::allow_all()
+                    },
+                )
+                .await;
+                let auth = AuthContext::default();
+                let error = if async_dispatch {
+                    dispatch_query(
+                        &state,
+                        ProxyQueryId::new(),
+                        "SELECT id FROM orders".into(),
+                        vec![],
+                        SessionContext::default(),
+                        FrontendProtocol::PostgresWire,
+                        ClusterGroupName("default".into()),
+                        false,
+                        None,
+                        0,
+                        &auth,
+                    )
+                    .await
+                    .err()
+                    .expect("access or translation rejection")
+                } else {
+                    setup_sync_query(
+                        &state,
+                        "SELECT id FROM orders".into(),
+                        vec![],
+                        SessionContext::default(),
+                        FrontendProtocol::PostgresWire,
+                        ClusterGroupName("default".into()),
+                        &auth,
+                    )
+                    .await
+                    .err()
+                    .expect("access or translation rejection")
+                };
+                if denied {
+                    assert!(matches!(error, QueryFluxError::Unauthorized(_)), "{error}");
+                } else {
+                    assert!(matches!(error, QueryFluxError::Translation(_)), "{error}");
+                }
+                let rows = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let rows = history
+                            .list_queries(&QueryFilters {
+                                limit: 10,
+                                ..Default::default()
+                            })
+                            .await
+                            .unwrap();
+                        if !rows.is_empty() {
+                            break rows;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("history write");
+                assert_eq!(rows.len(), 1);
+                let row = &rows[0];
+                assert_eq!(row.status, if denied { "Denied" } else { "Failed" });
+                assert_eq!(row.was_guard_blocked, denied);
+                let actions = row.guard_actions.as_ref().unwrap().as_array().unwrap();
+                assert_eq!(actions.len(), 1);
+                assert_eq!(actions[0]["guard"], "opa_access");
+                assert_eq!(actions[0]["action"], if denied { "deny" } else { "allow" });
+                if denied {
+                    assert_eq!(row.translation, None);
+                    assert!(!prometheus.gather_text().contains(
+                        "queryflux_translation_skipped_total{reason=\"sqlglot_unavailable\"}"
+                    ));
+                } else {
+                    assert_eq!(
+                        row.translation,
+                        Some(serde_json::json!({"status":"no","reason":"sqlglot_unavailable"}))
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn translation_fallback_and_bypass_preserve_access_control_rewrites() {
+        for (mode, protocol) in [
+            (TranslationMode::BestEffort, FrontendProtocol::PostgresWire),
+            (TranslationMode::Strict, FrontendProtocol::Mcp),
+            (TranslationMode::Strict, FrontendProtocol::TrinoHttp),
+        ] {
+            let (state, _, _) = fixture(mode).await;
+            install_access_policy(
+                &state,
+                AccessDecision {
+                    resources: vec![queryflux_access_control::ResourceDecision {
+                        table: "orders".into(),
+                        allow: true,
+                        reason: None,
+                        row_filters: vec![queryflux_access_control::RowFilter {
+                            expression: Some("tenant_id = 42".into()),
+                            ucast: None,
+                        }],
+                        column_masks: vec![],
+                    }],
+                },
+            )
+            .await;
+            let mut setup = setup_sync_query(
+                &state,
+                "SELECT id FROM orders".into(),
+                vec![],
+                SessionContext::default(),
+                protocol,
+                ClusterGroupName("default".into()),
+                &AuthContext::default(),
+            )
+            .await
+            .ok()
+            .expect("access-controlled execution setup");
+            assert!(
+                setup.translated.contains("tenant_id = 42"),
+                "{}",
+                setup.translated
+            );
+            assert_eq!(setup.ctx.sql, "SELECT id FROM orders");
+            assert_eq!(setup.guard_actions.len(), 1);
+            assert_eq!(setup.guard_actions[0].action, "rewrite");
+            assert_eq!(
+                setup.ctx.translation.unwrap().reason,
+                Some(if mode == TranslationMode::BestEffort {
+                    queryflux_core::query::TranslationReason::SqlglotUnavailable
+                } else {
+                    queryflux_core::query::TranslationReason::NotNeeded
+                })
+            );
+            setup.slot.release().await;
+        }
     }
 
     #[tokio::test]
