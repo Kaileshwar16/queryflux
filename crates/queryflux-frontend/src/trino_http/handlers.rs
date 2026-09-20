@@ -156,6 +156,7 @@ fn client_safe_message(e: &QueryFluxError) -> &'static str {
     match e {
         Persistence(_) => "Internal service error",
         Engine(_) => "Backend engine error",
+        Translation(_) => "Required SQL translation is unavailable or failed",
         Routing(_) | NoClusterGroupAvailable(_) => "Query routing failed",
         Config(_) => "Configuration error",
         // Empty → caller forwards Display (QueueFull / CapacityWaitTimeout detail).
@@ -1218,6 +1219,7 @@ pub async fn get_executing_statement(
         src_dialect: FrontendProtocol::TrinoHttp.default_dialect(),
         tgt_dialect: adapter.translation_target_dialect(),
         was_translated,
+        translation: executing.translation,
         translated_sql: if was_translated {
             Some(executing.sql.clone())
         } else {
@@ -1689,6 +1691,7 @@ mod cancel_executing_statement_tests {
         let executing = ExecutingQuery {
             id: ProxyQueryId("proxy-1".into()),
             sql: "SELECT 1".into(),
+            translation: None,
             translated_sql: None,
             cluster_group: group_name,
             cluster_name,

@@ -56,6 +56,26 @@ fn resolve_src_dialect(session: &SessionContext, protocol: &FrontendProtocol) ->
     protocol.default_dialect()
 }
 
+fn record_translation(
+    state: &AppState,
+    sql: &str,
+    outcome: queryflux_core::query::TranslationOutcome,
+    rejected: bool,
+) {
+    state.metrics.on_translation(outcome);
+    if let Some(reason) = outcome
+        .reason
+        .filter(|reason| *reason != queryflux_core::query::TranslationReason::NotNeeded)
+    {
+        warn!(
+            query_fingerprint = format_args!("{:016x}", queryflux_fingerprint::fast_hash(sql)),
+            reason = reason.as_str(),
+            rejected,
+            "SQL translation degraded"
+        );
+    }
+}
+
 /// Whether translation (and therefore sqlglot) should be invoked at all for this query.
 ///
 /// Every protocol except MCP has a wire-implied dialect, so translation always at least
@@ -361,10 +381,17 @@ pub async fn dispatch_query(
         }
     };
 
+    // Hand sync adapters to execute_to_sink before translation and its metrics run.
+    if matches!(adapter_kind, AdapterKind::Sync(_)) {
+        slot.release().await;
+        return Err(QueryFluxError::SyncEngineRequired(cluster_name.0.clone()));
+    }
+
     let tgt_dialect = adapter_kind.translation_target_dialect();
     let src_dialect = resolve_src_dialect(&session, &protocol);
     let engine_type = adapter_kind.engine_type();
     let original_sql = sql.clone();
+    let mut translation_outcome = queryflux_core::query::TranslationOutcome::not_needed();
     let sql = if should_attempt_translation(&session, &protocol) {
         let schema_context = state
             .translation
@@ -376,25 +403,69 @@ pub async fn dispatch_query(
                 session.database(),
             )
             .await;
-        match state
+        let report = state
             .translation
-            .maybe_translate(
+            .maybe_translate_report(
                 &sql,
                 &src_dialect,
                 &tgt_dialect,
                 &schema_context,
                 &group_fixups,
             )
-            .await
-        {
+            .await;
+        translation_outcome = report.outcome;
+        record_translation(state, &sql, translation_outcome, report.result.is_err());
+        match report.result {
             Ok(t) => t,
             Err(e) => {
-                warn!(id = %query_id, "Translation error: {e}");
+                let ctx = QueryContext {
+                    query_id: query_id.clone(),
+                    sql: original_sql.clone(),
+                    session: session.clone(),
+                    protocol: protocol.clone(),
+                    group: group.clone(),
+                    cluster: cluster_name.clone(),
+                    cluster_group_config_id,
+                    cluster_config_id,
+                    engine_type: engine_type.clone(),
+                    src_dialect: src_dialect.clone(),
+                    tgt_dialect: tgt_dialect.clone(),
+                    was_translated: false,
+                    translated_sql: None,
+                    translation: Some(translation_outcome),
+                    query_tags: effective_tags.clone(),
+                    query_params: params.clone(),
+                    agent_context: session.resolved_agent_context(),
+                };
+                state.record_query(
+                    &ctx,
+                    QueryOutcome {
+                        backend_query_id: None,
+                        status: QueryStatus::Failed,
+                        execution_ms: 0,
+                        rows: None,
+                        error: Some(e.to_string()),
+                        routing_trace: None,
+                        engine_stats: None,
+                        guard_actions: vec![],
+                        was_guard_blocked: false,
+                        queue_duration_ms,
+                        cache_hit: false,
+                    },
+                );
+                // Strict rejection is terminal: a later queued poll must not
+                // retry translation or count this query's rejection again.
+                if already_queued {
+                    if let Err(delete_error) = state.persistence.delete_queued(&query_id).await {
+                        warn!(id = %query_id, "Failed to remove translation-rejected queued query: {delete_error}");
+                    }
+                }
                 slot.release().await;
                 return Err(e);
             }
         }
     } else {
+        state.metrics.on_translation(translation_outcome);
         sql
     };
     let was_translated = sql != original_sql;
@@ -452,6 +523,7 @@ pub async fn dispatch_query(
                 src_dialect: src_dialect.clone(),
                 tgt_dialect: tgt_dialect.clone(),
                 was_translated,
+                translation: Some(translation_outcome),
                 translated_sql: if was_translated {
                     Some(sql.clone())
                 } else {
@@ -550,6 +622,7 @@ pub async fn dispatch_query(
             let executing = ExecutingQuery {
                 id: query_id.clone(),
                 sql,
+                translation: Some(translation_outcome),
                 translated_sql: if was_translated {
                     Some(original_sql)
                 } else {
@@ -641,6 +714,7 @@ pub async fn dispatch_query(
                         src_dialect,
                         tgt_dialect: adapter.translation_target_dialect(),
                         was_translated,
+                        translation: executing.translation,
                         translated_sql: if was_translated {
                             Some(executing.sql.clone())
                         } else {
@@ -666,13 +740,7 @@ pub async fn dispatch_query(
                 }
             }
         }
-        AdapterKind::Sync(_) => {
-            // dispatch_query is the async path only. A sync cluster selected by
-            // round-robin in a mixed group signals the caller to retry via
-            // execute_to_sink, which will drive its own slot acquisition loop.
-            slot.release().await;
-            Err(QueryFluxError::SyncEngineRequired(cluster_name.0.clone()))
-        }
+        AdapterKind::Sync(_) => unreachable!("sync adapters are handed off before translation"),
     }
 }
 
@@ -1422,6 +1490,7 @@ async fn setup_sync_query(
     // The caller (execute_to_sink) will notify the sink via on_error. Skipped entirely
     // (sqlglot never invoked) when should_attempt_translation is false — see its doc
     // comment for why MCP without a declared dialect takes this path.
+    let mut translation_outcome = queryflux_core::query::TranslationOutcome::not_needed();
     let translated = if should_attempt_translation(&session, &protocol) {
         let schema_context = state
             .translation
@@ -1433,21 +1502,22 @@ async fn setup_sync_query(
                 session.database(),
             )
             .await;
-        match state
+        let report = state
             .translation
-            .maybe_translate(
+            .maybe_translate_report(
                 &sql,
                 &src_dialect,
                 &tgt_dialect,
                 &schema_context,
                 &group_fixups,
             )
-            .await
-        {
+            .await;
+        translation_outcome = report.outcome;
+        record_translation(state, &sql, translation_outcome, report.result.is_err());
+        match report.result {
             Ok(t) => t,
             Err(e) => {
                 let err_msg = e.to_string();
-                warn!(id = %query_id, "Translation error: {err_msg}");
                 let ctx = QueryContext {
                     query_id: query_id.clone(),
                     sql: sql.clone(),
@@ -1461,6 +1531,7 @@ async fn setup_sync_query(
                     src_dialect: src_dialect.clone(),
                     tgt_dialect: tgt_dialect.clone(),
                     was_translated: false,
+                    translation: Some(translation_outcome),
                     translated_sql: None,
                     query_tags: effective_tags,
                     query_params: params,
@@ -1487,6 +1558,7 @@ async fn setup_sync_query(
             }
         }
     } else {
+        state.metrics.on_translation(translation_outcome);
         sql.clone()
     };
 
@@ -1550,6 +1622,7 @@ async fn setup_sync_query(
         src_dialect,
         tgt_dialect: tgt_dialect.clone(),
         was_translated,
+        translation: Some(translation_outcome),
         translated_sql: if was_translated {
             Some(translated.clone())
         } else {
@@ -1969,6 +2042,7 @@ pub async fn execute_to_sink(
                     src_dialect: queryflux_core::query::SqlDialect::Generic,
                     tgt_dialect: queryflux_core::query::SqlDialect::Generic,
                     was_translated: false,
+                    translation: None,
                     translated_sql: None,
                     query_tags: effective_tags,
                     query_params: vec![],
@@ -2595,6 +2669,260 @@ mod should_attempt_translation_tests {
                 should_attempt_translation(&session, &protocol),
                 "{protocol:?} should always attempt translation (maybe_translate no-ops on its own when compatible)"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod translation_policy_tests {
+    use super::*;
+    use crate::state::test_fixtures::app_state_with_metrics;
+    use queryflux_core::config::TranslationMode;
+    use queryflux_engine_adapters::trino::{TrinoAdapter, TrinoConfig};
+    use queryflux_metrics::{prometheus_store::PrometheusMetrics, MultiMetricsStore};
+    use queryflux_persistence::{
+        in_memory::InMemoryPersistence, query_history::QueryFilters, QueryHistoryStore,
+    };
+    use queryflux_translation::TranslationService;
+
+    async fn fixture(
+        mode: TranslationMode,
+    ) -> (
+        Arc<AppState>,
+        Arc<InMemoryPersistence>,
+        Arc<PrometheusMetrics>,
+    ) {
+        let history = Arc::new(InMemoryPersistence::new());
+        let prometheus = Arc::new(PrometheusMetrics::new().unwrap());
+        let metrics = Arc::new(MultiMetricsStore::new(vec![
+            history.clone(),
+            prometheus.clone(),
+        ]));
+        let mut state = app_state_with_metrics(metrics, false);
+        Arc::get_mut(&mut state).unwrap().translation =
+            Arc::new(TranslationService::unavailable(vec![]).with_policy(mode, false));
+        state.live.write().await.adapters.insert(
+            "trino".into(),
+            AdapterKind::Async(Arc::new(TrinoAdapter::new(
+                ClusterName("trino".into()),
+                ClusterGroupName("default".into()),
+                TrinoConfig {
+                    endpoint: "http://127.0.0.1:9".into(),
+                    tls_skip_verify: false,
+                    auth: None,
+                },
+            ))),
+        );
+        (state, history, prometheus)
+    }
+
+    #[tokio::test]
+    async fn trino_client_receives_a_clear_translation_error() {
+        use axum::response::IntoResponse;
+        let (state, _, _) = fixture(TranslationMode::Strict).await;
+        state.live.write().await.group_translation_scripts.insert(
+            "default".into(),
+            vec!["def transform(ast, src, dst): pass".into()],
+        );
+        let response = crate::trino_http::handlers::post_statement(
+            axum::extract::State(state),
+            axum::http::HeaderMap::new(),
+            Bytes::from("SELECT 1"),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"]["message"],
+            "Required SQL translation is unavailable or failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_strict_rejection_is_terminal_and_counted_once() {
+        use axum::{extract::Path, extract::State, http::HeaderMap, response::IntoResponse};
+        let (state, _, prometheus) = fixture(TranslationMode::Strict).await;
+        state.live.write().await.group_translation_scripts.insert(
+            "default".into(),
+            vec!["def transform(ast, src, dst): pass".into()],
+        );
+        let id = ProxyQueryId::new();
+        persist_queued_query(
+            &state,
+            id.clone(),
+            "SELECT 1".into(),
+            SessionContext::default(),
+            FrontendProtocol::TrinoHttp,
+            ClusterGroupName("default".into()),
+            false,
+            0,
+            None,
+            &AuthContext::default(),
+        )
+        .await
+        .unwrap();
+        let response = crate::trino_http::handlers::get_queued_statement(
+            State(state.clone()),
+            Path((id.0.clone(), 0)),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"]["message"],
+            "Required SQL translation is unavailable or failed"
+        );
+        let repeated_poll = crate::trino_http::handlers::get_queued_statement(
+            State(state),
+            Path((id.0, 1)),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(repeated_poll.status(), axum::http::StatusCode::NOT_FOUND);
+        assert!(prometheus
+            .gather_text()
+            .contains("queryflux_translation_skipped_total{reason=\"sqlglot_unavailable\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn strict_sync_and_async_rejections_are_recorded_and_release_capacity() {
+        for async_dispatch in [false, true] {
+            let (state, history, prometheus) = fixture(TranslationMode::Strict).await;
+            let auth = AuthContext::default();
+            let error = if async_dispatch {
+                dispatch_query(
+                    &state,
+                    ProxyQueryId::new(),
+                    "SELECT 1".into(),
+                    vec![],
+                    SessionContext::default(),
+                    FrontendProtocol::PostgresWire,
+                    ClusterGroupName("default".into()),
+                    false,
+                    None,
+                    0,
+                    &auth,
+                )
+                .await
+                .err()
+                .expect("strict rejection")
+            } else {
+                setup_sync_query(
+                    &state,
+                    "SELECT 1".into(),
+                    vec![],
+                    SessionContext::default(),
+                    FrontendProtocol::PostgresWire,
+                    ClusterGroupName("default".into()),
+                    &auth,
+                )
+                .await
+                .err()
+                .expect("strict rejection")
+            };
+            assert!(matches!(error, QueryFluxError::Translation(_)), "{error}");
+            let rows = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let rows = history
+                        .list_queries(&QueryFilters {
+                            limit: 10,
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                    if !rows.is_empty() {
+                        break rows;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("history write");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status, "Failed");
+            assert_eq!(
+                rows[0].translation,
+                Some(serde_json::json!({"status":"no","reason":"sqlglot_unavailable"}))
+            );
+            let text = prometheus.gather_text();
+            assert!(
+                text.contains(
+                    "queryflux_translation_skipped_total{reason=\"sqlglot_unavailable\"} 1"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "queryflux_running_queries{cluster_group=\"default\",cluster_name=\"trino\"} 0"
+                ),
+                "{text}"
+            );
+            // The next compatible request must still acquire capacity and must
+            // not inherit the rejected query's translation outcome.
+            let mut next = setup_sync_query(
+                &state,
+                "SELECT 2".into(),
+                vec![],
+                SessionContext::default(),
+                FrontendProtocol::TrinoHttp,
+                ClusterGroupName("default".into()),
+                &auth,
+            )
+            .await
+            .ok()
+            .expect("compatible request after strict rejection");
+            assert_eq!(
+                next.ctx.translation,
+                Some(queryflux_core::query::TranslationOutcome::not_needed())
+            );
+            next.slot.release().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn best_effort_and_compatible_strict_queries_reach_execution_setup() {
+        for (mode, protocol, reason) in [
+            (
+                TranslationMode::BestEffort,
+                FrontendProtocol::PostgresWire,
+                "sqlglot_unavailable",
+            ),
+            (
+                TranslationMode::Strict,
+                FrontendProtocol::TrinoHttp,
+                "not_needed",
+            ),
+        ] {
+            let (state, _, prometheus) = fixture(mode).await;
+            let mut setup = setup_sync_query(
+                &state,
+                "select 1".into(),
+                vec![],
+                SessionContext::default(),
+                protocol,
+                ClusterGroupName("default".into()),
+                &AuthContext::default(),
+            )
+            .await
+            .ok()
+            .expect("execution setup should succeed");
+            assert_eq!(setup.translated, "select 1");
+            assert_eq!(
+                setup.ctx.translation.unwrap().reason.unwrap().as_str(),
+                reason
+            );
+            assert!(prometheus.gather_text().contains(&format!(
+                "queryflux_translation_skipped_total{{reason=\"{reason}\"}} 1"
+            )));
+            setup.slot.release().await;
         }
     }
 }

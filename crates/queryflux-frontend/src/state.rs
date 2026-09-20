@@ -126,6 +126,7 @@ pub struct QueryContext {
     pub src_dialect: SqlDialect,
     pub tgt_dialect: SqlDialect,
     pub was_translated: bool,
+    pub translation: Option<queryflux_core::query::TranslationOutcome>,
     pub translated_sql: Option<String>,
     pub query_tags: QueryTags,
     /// Typed positional parameters extracted from the client's wire protocol.
@@ -253,6 +254,7 @@ impl AppState {
             source_dialect: ctx.src_dialect.clone(),
             target_dialect: ctx.tgt_dialect.clone(),
             was_translated: ctx.was_translated,
+            translation: ctx.translation,
             translated_sql: ctx.translated_sql.clone(),
             user: ctx.session.user().map(|s| s.to_string()),
             catalog: ctx.session.catalog().map(|s| s.to_string()),
@@ -343,6 +345,7 @@ impl AppState {
             src_dialect,
             tgt_dialect,
             was_translated,
+            translation: executing.translation,
             translated_sql: if was_translated {
                 Some(executing.sql.clone())
             } else {
@@ -395,6 +398,7 @@ impl AppState {
             src_dialect: dialect.clone(),
             tgt_dialect: dialect,
             was_translated: false,
+            translation: None,
             translated_sql: None,
             query_tags: session.tags.clone(),
             query_params: vec![],
@@ -469,6 +473,7 @@ impl AppState {
             src_dialect: dialect.clone(),
             tgt_dialect: SqlDialect::Generic,
             was_translated: false,
+            translation: None,
             translated_sql: None,
             query_tags,
             query_params: vec![],
@@ -571,6 +576,10 @@ mod record_terminal_tests {
         let executing = ExecutingQuery {
             id: ProxyQueryId("q-exec-cancel".into()),
             sql: "SELECT 1".into(),
+            translation: Some(queryflux_core::query::TranslationOutcome {
+                status: queryflux_core::query::TranslationStatus::Fallback,
+                reason: Some(queryflux_core::query::TranslationReason::NoSchema),
+            }),
             translated_sql: None,
             cluster_group: ClusterGroupName("default".into()),
             cluster_name: ClusterName("trino".into()),
@@ -588,6 +597,14 @@ mod record_terminal_tests {
             wire_auth: None,
             queue_duration_ms: 2500,
         };
+        let stored = serde_json::to_value(&executing).unwrap();
+        let executing: ExecutingQuery = serde_json::from_value(stored.clone()).unwrap();
+        let mut legacy = stored;
+        legacy.as_object_mut().unwrap().remove("translation");
+        assert!(serde_json::from_value::<ExecutingQuery>(legacy)
+            .unwrap()
+            .translation
+            .is_none());
         state.record_executing_cancelled(
             &executing,
             FrontendProtocol::TrinoHttp,
@@ -608,6 +625,11 @@ mod record_terminal_tests {
         assert!(rows[0].status.contains("Cancelled"));
         assert_eq!(rows[0].error_message.as_deref(), Some("client cancelled"));
         assert_eq!(rows[0].queue_duration_ms, 2500);
+        assert!(!rows[0].was_translated);
+        assert_eq!(
+            rows[0].translation,
+            Some(serde_json::json!({"status": "fallback", "reason": "no_schema"}))
+        );
     }
 }
 

@@ -295,12 +295,60 @@ impl IncomingQuery {
     }
 }
 
+/// Observable result of the translation stage, independent of SQL text changes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TranslationStatus {
+    Yes,
+    No,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranslationReason {
+    SqlglotUnavailable,
+    TranspileError,
+    NotNeeded,
+    NoSchema,
+    OptimizeError,
+}
+
+impl TranslationReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SqlglotUnavailable => "sqlglot_unavailable",
+            Self::TranspileError => "transpile_error",
+            Self::NotNeeded => "not_needed",
+            Self::NoSchema => "no_schema",
+            Self::OptimizeError => "optimize_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranslationOutcome {
+    pub status: TranslationStatus,
+    pub reason: Option<TranslationReason>,
+}
+
+impl TranslationOutcome {
+    pub fn not_needed() -> Self {
+        Self {
+            status: TranslationStatus::No,
+            reason: Some(TranslationReason::NotNeeded),
+        }
+    }
+}
+
 // --- Executing query (after routing, being dispatched) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutingQuery {
     pub id: ProxyQueryId,
     pub sql: String,
+    #[serde(default)]
+    pub translation: Option<TranslationOutcome>,
     pub translated_sql: Option<String>,
     pub cluster_group: ClusterGroupName,
     pub cluster_name: ClusterName,

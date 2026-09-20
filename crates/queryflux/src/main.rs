@@ -740,9 +740,13 @@ async fn main() -> Result<()> {
     let translation = Arc::new(
         TranslationService::new_sqlglot(config.translation.python_scripts.clone())
             .unwrap_or_else(|e| {
-                tracing::warn!("sqlglot unavailable ({e}), translation disabled");
-                TranslationService::disabled()
+                tracing::warn!(mode = ?config.translation.mode, "sqlglot unavailable ({e}); required translation will follow the configured policy");
+                TranslationService::unavailable(config.translation.python_scripts.clone())
             })
+            .with_policy(
+                config.translation.mode,
+                config.translation.error_on_unsupported,
+            )
             .with_schema_resolution_timeout(std::time::Duration::from_millis(
                 config.translation.schema_resolution_timeout_ms,
             )),
@@ -4151,6 +4155,7 @@ mod tests {
                 source_dialect: SqlDialect::Trino,
                 target_dialect: SqlDialect::DuckDb,
                 was_translated: false,
+                translation: None,
                 translated_sql: None,
                 user: None,
                 catalog: None,

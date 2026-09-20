@@ -22,6 +22,11 @@ pub struct QuerySummary {
     pub protocol: String,
     pub username: Option<String>,
     pub sql_preview: String,
+    /// Translation stage outcome; null for records written before this field existed.
+    #[serde(default)]
+    #[sqlx(default)]
+    #[schema(value_type = Option<Object>)]
+    pub translation: Option<serde_json::Value>,
     /// The SQL after dialect translation. Only present when `was_translated` is true.
     pub translated_sql: Option<String>,
     pub status: String,

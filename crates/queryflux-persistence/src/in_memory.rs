@@ -111,6 +111,9 @@ impl InMemoryPersistence {
             protocol: format!("{:?}", record.frontend_protocol),
             username: record.user,
             sql_preview: record.sql_preview,
+            translation: record.translation.map(|outcome| {
+                serde_json::to_value(outcome).expect("serializable translation outcome")
+            }),
             translated_sql: record.translated_sql,
             status: format!("{:?}", record.status),
             was_translated: record.was_translated,
@@ -1376,6 +1379,7 @@ mod tests {
             .upsert(ExecutingQuery {
                 id: ProxyQueryId("q-qd".into()),
                 sql: "SELECT 1".into(),
+                translation: None,
                 translated_sql: None,
                 cluster_group: ClusterGroupName("test".into()),
                 cluster_name: queryflux_core::query::ClusterName("trino".into()),
@@ -1625,6 +1629,7 @@ mod tests {
             source_dialect: SqlDialect::Trino,
             target_dialect: SqlDialect::Generic,
             was_translated: false,
+            translation: None,
             translated_sql: None,
             user: None,
             catalog: None,

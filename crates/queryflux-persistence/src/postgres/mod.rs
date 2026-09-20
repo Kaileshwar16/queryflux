@@ -273,7 +273,7 @@ impl QueryHistoryStore for PostgresStore {
                       COALESCE(cc.name, qr.cluster_name) AS cluster_name,
                       qr.cluster_group_id, qr.cluster_id,
                       qr.engine_type, qr.frontend_protocol, qr.username, qr.sql_preview, qr.translated_sql,
-                      qr.status, qr.was_translated,
+                      qr.status, qr.was_translated, qr.translation,
                       qr.source_dialect, qr.target_dialect, qr.queue_duration_ms, qr.execution_duration_ms,
                       qr.rows_returned, qr.error_message, qr.routing_trace, qr.created_at,
                       qr.engine_elapsed_time_ms, qr.cpu_time_ms, qr.processed_rows, qr.processed_bytes,
@@ -459,7 +459,7 @@ impl QueryHistoryStore for PostgresStore {
                       COALESCE(cc.name, qr.cluster_name)  AS cluster_name,
                       qr.cluster_group_id, qr.cluster_id,
                       qr.engine_type, qr.frontend_protocol, qr.username, qr.sql_preview, qr.translated_sql,
-                      qr.status, qr.was_translated,
+                      qr.status, qr.was_translated, qr.translation,
                       qr.source_dialect, qr.target_dialect, qr.queue_duration_ms, qr.execution_duration_ms,
                       qr.rows_returned, qr.error_message, qr.routing_trace, qr.created_at,
                       qr.engine_elapsed_time_ms, qr.cpu_time_ms, qr.processed_rows, qr.processed_bytes,
@@ -1720,10 +1720,10 @@ impl MetricsStore for PostgresStore {
                  cluster_group_id, cluster_id, query_tags,
                  query_hash, query_parameterized_hash, translated_query_hash,
                  agent_id, conversation_id, step_index, tool_call_id, query_intent,
-                 guard_actions, was_guard_blocked, cache_hit)
+                 guard_actions, was_guard_blocked, cache_hit, translation)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
                        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,
-                       $36,$37,$38,$39,$40,$41,$42,$43)
+                       $36,$37,$38,$39,$40,$41,$42,$43,$44)
                ON CONFLICT (proxy_query_id) DO NOTHING"#,
         )
         .bind(&r.proxy_query_id)
@@ -1769,6 +1769,9 @@ impl MetricsStore for PostgresStore {
         .bind(guard_actions_json)
         .bind(r.was_guard_blocked)
         .bind(r.cache_hit)
+        .bind(r.translation.map(|outcome| {
+            serde_json::to_value(outcome).expect("serializable translation outcome")
+        }))
         .execute(&self.admin_pool)
         .await
         .map_err(|e| QueryFluxError::Persistence(format!("Insert query_records: {e}")))?;
@@ -3011,6 +3014,7 @@ mod tests {
         use crate::{MetricsStore, QueryHistoryStore, QueryRecord};
         use queryflux_core::query::{
             ClusterGroupName, ClusterName, EngineType, FrontendProtocol, QueryStatus, SqlDialect,
+            TranslationOutcome, TranslationReason, TranslationStatus,
         };
 
         let store = test_store().await;
@@ -3027,6 +3031,10 @@ mod tests {
             source_dialect: SqlDialect::Trino,
             target_dialect: SqlDialect::Generic,
             was_translated: false,
+            translation: Some(TranslationOutcome {
+                status: TranslationStatus::Fallback,
+                reason: Some(TranslationReason::NoSchema),
+            }),
             translated_sql: None,
             user: None,
             catalog: None,
@@ -3047,7 +3055,7 @@ mod tests {
             digest_text: Some("select 1".into()),
             translated_digest_text: None,
             agent_id: None,
-            conversation_id: None,
+            conversation_id: Some(proxy_id.clone()),
             step_index: None,
             tool_call_id: None,
             query_intent: None,
@@ -3058,7 +3066,7 @@ mod tests {
         store.record_query(first.clone()).await.unwrap();
         first.status = QueryStatus::Cancelled;
         first.error_message = Some("client cancelled".into());
-        store.record_query(first).await.unwrap();
+        store.record_query(first.clone()).await.unwrap();
 
         let rows = store
             .list_queries(&QueryFilters {
@@ -3070,6 +3078,11 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].proxy_query_id, proxy_id);
         assert!(rows[0].status.contains("Failed"));
+        let expected = Some(serde_json::json!({"status": "fallback", "reason": "no_schema"}));
+        assert_eq!(rows[0].translation, expected);
+        let conversation = store.get_conversation(&proxy_id).await.unwrap();
+        assert_eq!(conversation.len(), 1);
+        assert_eq!(conversation[0].translation, expected);
 
         let digest_count: (i64,) = sqlx::query_as(
             "SELECT call_count FROM query_digest_stats WHERE query_parameterized_hash = $1",
@@ -3079,5 +3092,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(digest_count.0, 1);
+
+        // A query that never reached translation must retain an unknown outcome.
+        first.proxy_query_id = unique_id("untranslated");
+        first.translation = None;
+        first.conversation_id = Some(first.proxy_query_id.clone());
+        let untranslated_id = first.proxy_query_id.clone();
+        store.record_query(first).await.unwrap();
+        let untranslated = store.get_conversation(&untranslated_id).await.unwrap();
+        assert_eq!(untranslated.len(), 1);
+        assert!(untranslated[0].translation.is_none());
     }
 }

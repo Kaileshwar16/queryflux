@@ -2920,6 +2920,7 @@ mod tests {
             .upsert(ExecutingQuery {
                 id: ProxyQueryId("exec-1".into()),
                 sql: "SELECT 1".into(),
+                translation: None,
                 translated_sql: None,
                 cluster_group: ClusterGroupName("analytics".into()),
                 cluster_name: ClusterName("trino".into()),
