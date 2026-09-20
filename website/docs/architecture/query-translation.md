@@ -166,7 +166,7 @@ In addition to global YAML scripts, you can attach **reusable scripts** to indiv
 
 ### Error handling
 
-If a script raises a Python exception, the query fails with a `Translation` error and the SQL is **not** sent to the backend. The error message includes the script index and the Python traceback. Scripts do not affect queries that skip translation (compatible dialects).
+If a script raises a Python exception, the outcome records `transpile_error`. In `bestEffort` mode, the original SQL is forwarded; in `strict` mode (or with `errorOnUnsupported: true`), the query is rejected before backend submission. Configured scripts run even for compatible dialects. MCP queries without a declared source dialect bypass translation and scripts.
 
 ### Implementation notes
 
@@ -177,7 +177,7 @@ If a script raises a Python exception, the query fails with a `Translation` erro
 
 ## Failure modes
 
-- **sqlglot missing** — Startup degrades to a disabled translation service; SQL is sent as-is, which may fail on the backend if dialects differ.
-- **Translation errors** — Dispatch releases the acquired cluster slot and returns an error to the client (async Trino path logs and propagates; sync `execute_to_sink` path reports via the result sink).
+- **sqlglot missing** — The service retains the configured policy and fixups. When translation is required, `bestEffort` forwards the original SQL and records `sqlglot_unavailable`; `strict` rejects the query before backend submission. Queries that do not require translation can still proceed.
+- **Translation errors** — Parsing, SQL generation, and fixup failures record `transpile_error`. In `bestEffort` mode, dispatch forwards the original SQL. In `strict` mode, dispatch releases the acquired cluster slot and returns a translation error before backend submission. The legacy `errorOnUnsupported: true` option also enables strict behavior. Successful dialect-only fallbacks remain allowed in both modes.
 
 For how routing picks the group and cluster **before** translation, see [routing-and-clusters.md](routing-and-clusters.md).
