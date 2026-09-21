@@ -424,7 +424,7 @@ pub async fn dispatch_query(
     // decision (including row filters / column masks) is intent-level and answerable from
     // what the client actually sent. See `access_control_guard::run_access_control_stage`.
     let mut all_guard_actions: Vec<queryflux_persistence::GuardAction> = Vec::new();
-    let sql = if let Some(guard) = &access_control_guard {
+    let access_controlled_sql = if let Some(guard) = &access_control_guard {
         use crate::access_control_guard::{run_access_control_stage, AccessStageOutcome};
         match run_access_control_stage(
             guard,
@@ -499,7 +499,7 @@ pub async fn dispatch_query(
         let report = state
             .translation
             .maybe_translate_report(
-                &sql,
+                &access_controlled_sql,
                 &src_dialect,
                 &tgt_dialect,
                 &schema_context,
@@ -564,9 +564,9 @@ pub async fn dispatch_query(
         }
     } else {
         state.metrics.on_translation(translation_outcome);
-        sql
+        access_controlled_sql.clone()
     };
-    let was_translated = sql != original_sql;
+    let was_translated = sql != access_controlled_sql;
     if was_translated {
         info!(id = %query_id, src = ?src_dialect, tgt = ?tgt_dialect, "SQL translated");
     }
@@ -717,7 +717,13 @@ pub async fn dispatch_query(
             let now = Utc::now();
             let executing = ExecutingQuery {
                 id: query_id.clone(),
-                sql,
+                // When translated_sql is absent, terminal history reads sql as
+                // the client input. The backend already received the rewritten SQL.
+                sql: if was_translated {
+                    sql
+                } else {
+                    original_sql.clone()
+                },
                 translation: Some(translation_outcome),
                 translated_sql: if was_translated {
                     Some(original_sql)
@@ -1744,10 +1750,10 @@ async fn setup_sync_query(
         }
     } else {
         state.metrics.on_translation(translation_outcome);
-        access_controlled_sql
+        access_controlled_sql.clone()
     };
 
-    let was_translated = translated != sql;
+    let was_translated = translated != access_controlled_sql;
 
     let credentials = match state
         .identity_resolver
@@ -2952,6 +2958,86 @@ mod translation_policy_tests {
             )));
     }
 
+    struct RewriteCheckingAdapter {
+        complete_on_submit: bool,
+    }
+
+    #[async_trait]
+    impl AsyncAdapter for RewriteCheckingAdapter {
+        async fn submit_query(
+            &self,
+            sql: &str,
+            _session: &SessionContext,
+            _credentials: &QueryCredentials,
+            _tags: &QueryTags,
+            _params: &QueryParams,
+        ) -> Result<QueryExecution> {
+            assert!(sql.contains("tenant_id = 42"), "{sql}");
+            let backend_query_id = queryflux_core::query::BackendQueryId("rewrite-test".into());
+            Ok(if self.complete_on_submit {
+                QueryExecution::Completed {
+                    backend_query_id,
+                    status: QueryStatus::Success,
+                    error: None,
+                    engine_stats: None,
+                    initial_response: None,
+                }
+            } else {
+                QueryExecution::Running {
+                    backend_query_id,
+                    poll_token: None,
+                    initial_response: None,
+                }
+            })
+        }
+
+        async fn poll_query(
+            &self,
+            _backend_id: &queryflux_core::query::BackendQueryId,
+            _poll_token: Option<&str>,
+            _wire_auth: Option<&StoredWireAuth>,
+        ) -> Result<queryflux_core::query::QueryPollResult> {
+            unreachable!("this test does not poll")
+        }
+
+        async fn cancel_query(
+            &self,
+            _backend_id: &queryflux_core::query::BackendQueryId,
+            _wire_auth: Option<&StoredWireAuth>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn engine_type(&self) -> queryflux_core::query::EngineType {
+            queryflux_core::query::EngineType::Trino
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn list_catalogs(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn list_databases(&self, _catalog: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn list_tables(&self, _catalog: &str, _database: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+
+        async fn describe_table(
+            &self,
+            _catalog: &str,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<queryflux_core::catalog::TableSchema>> {
+            Ok(None)
+        }
+    }
+
     #[tokio::test]
     async fn access_control_precedes_strict_translation_and_retains_its_audit() {
         for async_dispatch in [false, true] {
@@ -3050,7 +3136,7 @@ mod translation_policy_tests {
             (TranslationMode::Strict, FrontendProtocol::Mcp),
             (TranslationMode::Strict, FrontendProtocol::TrinoHttp),
         ] {
-            let (state, _, _) = fixture(mode).await;
+            let (state, history, _) = fixture(mode).await;
             install_access_policy(
                 &state,
                 AccessDecision {
@@ -3072,7 +3158,7 @@ mod translation_policy_tests {
                 "SELECT id FROM orders".into(),
                 vec![],
                 SessionContext::default(),
-                protocol,
+                protocol.clone(),
                 ClusterGroupName("default".into()),
                 &AuthContext::default(),
             )
@@ -3084,6 +3170,8 @@ mod translation_policy_tests {
                 setup.translated
             );
             assert_eq!(setup.ctx.sql, "SELECT id FROM orders");
+            assert!(!setup.ctx.was_translated);
+            assert_eq!(setup.ctx.translated_sql, None);
             assert_eq!(setup.guard_actions.len(), 1);
             assert_eq!(setup.guard_actions[0].action, "rewrite");
             assert_eq!(
@@ -3095,6 +3183,96 @@ mod translation_policy_tests {
                 })
             );
             setup.slot.release().await;
+
+            for complete_on_submit in [true, false] {
+                state.live.write().await.adapters.insert(
+                    "trino".into(),
+                    AdapterKind::Async(Arc::new(RewriteCheckingAdapter { complete_on_submit })),
+                );
+                let query_id = ProxyQueryId::new();
+                dispatch_query(
+                    &state,
+                    query_id.clone(),
+                    "SELECT id FROM orders".into(),
+                    vec![],
+                    SessionContext::default(),
+                    protocol.clone(),
+                    ClusterGroupName("default".into()),
+                    false,
+                    None,
+                    0,
+                    &AuthContext::default(),
+                )
+                .await
+                .expect("access-controlled async submission");
+                if !complete_on_submit {
+                    let executing = state
+                        .persistence
+                        .get(&queryflux_core::query::BackendQueryId(
+                            "rewrite-test".into(),
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(executing.sql, "SELECT id FROM orders");
+                    assert_eq!(executing.translated_sql, None);
+                    state.record_executing_cancelled(
+                        &executing,
+                        protocol.clone(),
+                        queryflux_core::query::EngineType::Trino,
+                        SqlDialect::Trino,
+                        "test cancellation",
+                    );
+                    state
+                        .release_query_slot(
+                            &executing.cluster_group,
+                            &executing.cluster_name,
+                            &executing.id.0,
+                        )
+                        .await;
+                    state
+                        .persistence
+                        .delete(&executing.backend_query_id)
+                        .await
+                        .unwrap();
+                }
+                let row = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let rows = history
+                            .list_queries(&QueryFilters {
+                                limit: 10,
+                                ..Default::default()
+                            })
+                            .await
+                            .unwrap();
+                        if let Some(row) = rows
+                            .into_iter()
+                            .find(|row| row.proxy_query_id == query_id.0)
+                        {
+                            break row;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("async history write");
+                assert_eq!(row.sql_preview, "SELECT id FROM orders");
+                assert!(!row.was_translated);
+                assert_eq!(row.translated_sql, None);
+                assert_eq!(
+                    row.translation,
+                    Some(serde_json::to_value(setup.ctx.translation.unwrap()).unwrap())
+                );
+                assert_eq!(
+                    row.status,
+                    if complete_on_submit {
+                        "Success"
+                    } else {
+                        "Cancelled"
+                    }
+                );
+                assert_eq!(row.guard_actions.as_ref().unwrap()[0]["action"], "rewrite");
+            }
         }
     }
 
