@@ -507,7 +507,12 @@ pub async fn dispatch_query(
             )
             .await;
         translation_outcome = report.outcome;
-        record_translation(state, &sql, translation_outcome, report.result.is_err());
+        record_translation(
+            state,
+            &original_sql,
+            translation_outcome,
+            report.result.is_err(),
+        );
         match report.result {
             Ok(t) => t,
             Err(e) => {
