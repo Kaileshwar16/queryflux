@@ -2090,15 +2090,20 @@ pub async fn execute_to_sink(
     // --- Query result cache: check for hit before acquiring a cluster slot ---
     let cache_hint = queryflux_cache::extract_cache_hint(&sql, &session);
     let effective_cache = cache_cfg.or_else(|| cache_hint.as_ref().map(|h| h.to_group_config()));
-    let cache_key = effective_cache
-        .as_ref()
-        .filter(|_| {
-            queryflux_cache::is_deterministic(
-                &sql,
-                &queryflux_fingerprint::polyglot_dialect(&protocol.default_dialect()),
-            )
-        })
-        .map(|_| queryflux_cache::CacheKey::new(&sql, &group.0, &session, &auth_ctx.user, &params));
+    let cache_eligible = if effective_cache.is_some() {
+        let sql = sql.clone();
+        let dialect =
+            queryflux_fingerprint::polyglot_dialect(&resolve_src_dialect(&session, &protocol));
+        // The parser uses a large-stack pool, but waiting on that pool is
+        // synchronous. Keep both classification and determinism off Tokio workers.
+        tokio::task::spawn_blocking(move || queryflux_cache::is_cacheable(&sql, &dialect))
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let cache_key = cache_eligible
+        .then(|| queryflux_cache::CacheKey::new(&sql, &group.0, &session, &auth_ctx.user, &params));
 
     if let Some(ref key) = cache_key {
         let effective_tags = {
