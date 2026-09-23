@@ -18,6 +18,7 @@ pub fn is_cacheable(sql: &str, dialect: &str) -> bool {
     read_only && crate::is_deterministic(sql, dialect)
 }
 
+/// Recognize supported query roots; nested read-only safety is checked separately.
 fn is_query(expr: &Expression) -> bool {
     matches!(
         expr,
@@ -30,6 +31,7 @@ fn is_query(expr: &Expression) -> bool {
     )
 }
 
+/// Reject side effects, nondeterministic clauses, and unsupported nodes anywhere in the AST.
 fn safe_tree(expr: &Expression) -> bool {
     // DfsIter visits CTE bodies and set operands, so checking only the root is
     // insufficient. It does not visit every field/variant in polyglot 0.3.2:
@@ -145,6 +147,7 @@ fn safe_tree(expr: &Expression) -> bool {
 mod tests {
     use super::*;
 
+    /// Keep supported reads cacheable across comments, CTEs, set operations, and batches.
     #[test]
     fn deterministic_reads() {
         for sql in [
@@ -165,6 +168,7 @@ mod tests {
         }
     }
 
+    /// Fail closed for writes, nested mutations, opaque commands, and invalid SQL.
     #[test]
     fn writes_and_ambiguous_sql_are_uncacheable() {
         for sql in [
@@ -190,6 +194,7 @@ mod tests {
         ] { assert!(!is_cacheable(sql, "postgresql"), "{sql}"); }
     }
 
+    /// Prove that a deterministic write remains ineligible for result caching.
     #[test]
     fn determinism_is_not_read_only_classification() {
         let sql = "INSERT INTO t VALUES (1) RETURNING id";
@@ -197,6 +202,7 @@ mod tests {
         assert!(!is_cacheable(sql, "duckdb"));
     }
 
+    /// Exclude random sampling even when the SQL contains no volatile function call.
     #[test]
     fn random_sampling_is_not_cacheable() {
         assert!(!is_cacheable(
@@ -205,6 +211,7 @@ mod tests {
         ));
     }
 
+    /// Allow deterministic pattern filters while rejecting unsafe ESCAPE expressions.
     #[test]
     fn ordinary_pattern_filters_are_cacheable() {
         assert!(is_cacheable(
@@ -225,6 +232,7 @@ mod tests {
         ));
     }
 
+    /// Verify AST traversal rejects nested writes without relying on parser failure.
     #[test]
     fn nested_writes_are_rejected_after_successful_parse() {
         // Prove the tree check catches these, rather than relying on parse failure.

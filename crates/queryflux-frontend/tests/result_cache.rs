@@ -39,12 +39,15 @@ struct Metrics {
 }
 #[async_trait]
 impl MetricsStore for Metrics {
+    /// Discard query history so cache assertions depend only on synchronous hit counters.
     async fn record_query(&self, _: QueryRecord) -> Result<()> {
         Ok(())
     }
+    /// Ignore cluster snapshots, which are unrelated to result-cache behavior.
     async fn record_cluster_snapshot(&self, _: ClusterSnapshot) -> Result<()> {
         Ok(())
     }
+    /// Count successful cache replays independently of query-history persistence.
     fn on_cache_hit(&self, _: &str) {
         self.hits.fetch_add(1, Ordering::SeqCst);
     }
@@ -57,17 +60,21 @@ struct Sink {
 }
 #[async_trait]
 impl ResultSink for Sink {
+    /// Accept schema callbacks; result assertions inspect the collected Arrow batches.
     async fn on_schema(&mut self, _: &Schema) -> Result<()> {
         Ok(())
     }
+    /// Retain each batch so tests can compare cached results with engine output.
     async fn on_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         self.batches.push(batch.clone());
         Ok(())
     }
+    /// Record terminal success so fixture requests cannot silently finish incomplete.
     async fn on_complete(&mut self, _: &QueryStats) -> Result<()> {
         self.completed = true;
         Ok(())
     }
+    /// Propagate engine errors for assertions that invalid SQL still reaches DuckDB.
     async fn on_error(&mut self, message: &str) -> Result<()> {
         Err(queryflux_core::error::QueryFluxError::Engine(
             message.into(),
@@ -83,11 +90,13 @@ struct Fixture {
     metrics: Arc<Metrics>,
 }
 impl Drop for Fixture {
+    /// Remove this fixture's cache files even when a test exits through a failed assertion.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 impl Fixture {
+    /// Create an isolated filesystem cache, metadata store, and in-memory DuckDB database.
     async fn new() -> Self {
         let root =
             std::env::temp_dir().join(format!("queryflux-cache-write-{}", uuid::Uuid::new_v4()));
@@ -111,9 +120,11 @@ impl Fixture {
             },
         }
     }
+    /// Build the same cache key dispatch uses for this fixture's identity and database.
     fn key(&self, sql: &str) -> CacheKey {
         CacheKey::new(sql, "duckdb", &self.session, "alice", &[])
     }
+    /// Dispatch one separate request, returning its results or propagating execution errors.
     async fn try_run(&self, sql: &str) -> Result<Sink> {
         let mut sink = Sink::default();
         execute_to_sink(
@@ -133,12 +144,15 @@ impl Fixture {
         assert!(sink.completed);
         Ok(sink)
     }
+    /// Execute a request that must succeed and return its collected results.
     async fn run(&self, sql: &str) -> Sink {
         self.try_run(sql).await.unwrap()
     }
+    /// Read the number of successful cache replays observed by this fixture.
     fn hits(&self) -> usize {
         self.metrics.hits.load(Ordering::SeqCst)
     }
+    /// Execute a query whose first result cell must be a non-null Arrow Int64 value.
     async fn scalar(&self, sql: &str) -> i64 {
         self.run(sql).await.batches[0]
             .column(0)
@@ -147,6 +161,7 @@ impl Fixture {
             .unwrap()
             .value(0)
     }
+    /// Store a sentinel result directly to model an entry created before eligibility checks.
     async fn seed(&self, sql: &str) {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "poison",
@@ -167,6 +182,7 @@ impl Fixture {
         writer.finalize(true).await.unwrap();
         assert!(self.cached(sql).await, "fixture must seed a live entry");
     }
+    /// Check whether unexpired cache metadata exists for this exact request.
     async fn cached(&self, sql: &str) -> bool {
         self.store
             .cache_get_valid(&self.key(sql).hex)
@@ -176,6 +192,7 @@ impl Fixture {
     }
 }
 
+/// Reproduce the reported duplicate insert and require two rows with no write caching.
 #[tokio::test]
 async fn repeated_insert_returning_executes_twice() {
     let f = Fixture::new().await;
@@ -199,6 +216,7 @@ async fn repeated_insert_returning_executes_twice() {
     assert!(!stored, "writes must not be stored");
     assert_eq!(f.hits(), 0);
 }
+/// Wire real dispatch to one DuckDB connection and an enabled 300-second result cache.
 async fn test_state(cache: Arc<dyn QueryResultCache>, metrics: Arc<Metrics>) -> Arc<AppState> {
     let group_name = ClusterGroupName("duckdb".into());
     let cluster_name = ClusterName("duckdb-1".into());
@@ -282,6 +300,7 @@ async fn test_state(cache: Arc<dyn QueryResultCache>, metrics: Arc<Metrics>) -> 
     })
 }
 
+/// Require DDL and DML to execute even when matching sentinel cache entries exist.
 #[tokio::test]
 async fn writes_do_not_replay_existing_entries() {
     let f = Fixture::new().await;
@@ -313,6 +332,7 @@ async fn writes_do_not_replay_existing_entries() {
     assert_eq!(f.hits(), 0);
 }
 
+/// Verify repeated updates and deletes change database state instead of replaying RETURNING rows.
 #[tokio::test]
 async fn repeated_update_and_delete_returning_execute() {
     let f = Fixture::new().await;
@@ -331,6 +351,7 @@ async fn repeated_update_and_delete_returning_execute() {
     assert_eq!(f.hits(), 0);
 }
 
+/// Verify supported reads store results and replay identical Arrow batches on repetition.
 #[tokio::test]
 async fn deterministic_selects_still_hit_cache() {
     let f = Fixture::new().await;
@@ -354,6 +375,7 @@ async fn deterministic_selects_still_hit_cache() {
     }
 }
 
+/// Reject caching for mixed batches regardless of whether the write comes first or last.
 #[tokio::test]
 async fn mixed_read_write_batches_bypass_lookup_and_storage() {
     let f = Fixture::new().await;
@@ -371,6 +393,7 @@ async fn mixed_read_write_batches_bypass_lookup_and_storage() {
     assert_eq!(f.hits(), 0);
 }
 
+/// Preserve engine errors for invalid SQL despite a matching cached result.
 #[tokio::test]
 async fn parse_failures_do_not_replay_existing_entries() {
     let f = Fixture::new().await;
@@ -388,6 +411,7 @@ async fn parse_failures_do_not_replay_existing_entries() {
     assert_eq!(f.hits(), 1);
 }
 
+/// Require sequence-advancing SELECT functions to execute on every request.
 #[tokio::test]
 async fn unsupported_select_functions_execute_normally() {
     let f = Fixture::new().await;
@@ -400,6 +424,7 @@ async fn unsupported_select_functions_execute_normally() {
     assert_eq!(f.hits(), 0);
 }
 
+/// Verify sampling bypasses caching without asserting differences between random results.
 #[tokio::test]
 async fn random_sampling_bypasses_lookup_and_storage() {
     let f = Fixture::new().await;
@@ -413,6 +438,7 @@ async fn random_sampling_bypasses_lookup_and_storage() {
     assert_eq!(f.hits(), 0);
 }
 
+/// Catch sequence side effects inside ESCAPE expressions that the generic AST walk skips.
 #[tokio::test]
 async fn pattern_escape_side_effects_bypass_lookup_and_storage() {
     let f = Fixture::new().await;
@@ -426,6 +452,7 @@ async fn pattern_escape_side_effects_bypass_lookup_and_storage() {
     assert_eq!(f.hits(), 0);
 }
 
+/// Check that header, tag, and comment hints enable read caching but cannot cache writes.
 #[tokio::test]
 async fn hints_cannot_enable_caching_for_writes() {
     for hint in ["header", "tag", "comment"] {
