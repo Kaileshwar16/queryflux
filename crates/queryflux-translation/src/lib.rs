@@ -2,8 +2,8 @@ pub mod access;
 pub mod sqlglot;
 
 pub use access::{
-    extract_resources, render_mask, rewrite_table_scans, ExtractedResource, MaskRenderError,
-    TablePolicy,
+    extract_resources, render_mask, rewrite_table_scans, ExtractedResource, ExtractedStatement,
+    MaskRenderError, TablePolicy,
 };
 
 use std::collections::HashMap;
@@ -61,9 +61,10 @@ impl TranslatorTrait for PassthroughTranslator {
 /// Returns the original SQL unchanged when dialects match (zero overhead).
 ///
 /// User-defined Python scripts run after every sqlglot translation. Each script
-/// must define `def transform(ast, src: str, dst: str) -> None:`. Top-level
-/// imports and helper functions are fully supported. Scripts mutate `ast`
-/// in-place.
+/// must define `def transform(sql: str, src: str, dst: str) -> str:`. Top-level
+/// imports and helper functions are fully supported. Scripts receive SQL text and
+/// return SQL text — a script that needs AST-level control can `import sqlglot`
+/// (or any other parser) itself and return `.sql(dialect=dst)`.
 /// Default catalog-lookup timeout for `resolve_schema_context` when the caller
 /// doesn't override it via `with_schema_resolution_timeout` — matches
 /// `TranslationConfig`'s own default.
@@ -80,6 +81,14 @@ impl TranslationService {
     /// Verifies sqlglot is importable at startup.
     pub fn new_sqlglot(python_scripts: Vec<String>) -> Result<Self> {
         SqlglotTranslator::check_available()?;
+        // YAML is operator-authored and read once at startup, so — unlike the DB-persisted
+        // per-group scripts in `queryflux::validate_group_translation_scripts`, which are
+        // filtered rather than fatal — a script that fails the current contract aborts
+        // startup here, consistent with this codebase's fail-startup-on-bad-explicit-config
+        // convention elsewhere (e.g. access-control YAML validation).
+        for script in &python_scripts {
+            sqlglot::validate_fixup_script(script)?;
+        }
         Ok(Self {
             enabled: true,
             python_scripts,

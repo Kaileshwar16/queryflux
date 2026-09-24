@@ -18,6 +18,19 @@ pub struct ExtractedResource {
     pub schema: Option<String>,
     pub table: String,
     pub columns: Columns,
+    /// The table the statement writes to (`INSERT INTO t`, `UPDATE t`, `CREATE TABLE t AS`,
+    /// ...). Every other extracted table is read.
+    pub is_write_target: bool,
+}
+
+/// The tables a statement touches, split into reads and the write target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedStatement {
+    pub resources: Vec<ExtractedResource>,
+    /// Whether the statement embeds reads of other tables — true for queries and for
+    /// `INSERT`/`UPDATE`/`DELETE`/`MERGE`/`CREATE ... AS <query>`, false for statements that
+    /// merely name a table (`DESCRIBE`, `DROP`, `ALTER`, ...).
+    pub embeds_reads: bool,
 }
 
 /// Per-table policy for [`rewrite_table_scans`].
@@ -74,7 +87,24 @@ pub fn render_mask(
                 .ok_or_else(|| MaskRenderError::MissingConstantValue(mask.column.clone()))?;
             format!("'{}'", v.replace('\'', "''"))
         }
-        MaskType::Redact => format!("regexp_replace({c}, '[A-Za-z0-9]', 'x')"),
+        MaskType::Redact => match src {
+            // Trino/Athena's 3-arg `regexp_replace` already replaces every match; a 4th
+            // positional argument there is a capture-group index, not a flag, so adding one
+            // would either change behavior or be invalid.
+            SqlDialect::Trino | SqlDialect::Athena => {
+                format!("regexp_replace({c}, '[A-Za-z0-9]', 'x')")
+            }
+            // Postgres and DuckDB's 3-arg form replaces only the *first* match — silently
+            // leaving most of a "redacted" value unmasked is exactly the data exposure this
+            // mask exists to prevent, so the `g` (global) flag is required here.
+            SqlDialect::Postgres | SqlDialect::DuckDb => {
+                format!("regexp_replace({c}, '[A-Za-z0-9]', 'x', 'g')")
+            }
+            // Other dialects' regexp_replace global-vs-first-match semantics haven't been
+            // verified; falls back to the (possibly first-match-only) form rather than
+            // guessing at a flags syntax that could produce invalid SQL.
+            _ => format!("regexp_replace({c}, '[A-Za-z0-9]', 'x')"),
+        },
         MaskType::ShowLast4 => {
             format!("CASE WHEN {c} IS NULL THEN NULL ELSE '****' || substr({c}, -4) END")
         }
@@ -105,13 +135,15 @@ fn dialect_kwarg(dialect: &SqlDialect) -> String {
 }
 
 /// Extract every base table (and, when `schema` is populated, the columns attributed to
-/// each) that `sql` references. CTE-defined names are excluded. Best-effort: a parse
-/// failure yields `Ok(vec![])`.
+/// each) that `sql` references. CTE-defined names are excluded. A genuine parse failure
+/// yields `Err` — callers must not treat it the same as an `Ok` with no resources (a
+/// query that genuinely references no base tables), or a query the parser can't analyze silently
+/// skips access control instead of hitting the caller's `onMissingSchema` fail path.
 pub fn extract_resources(
     sql: &str,
     src_dialect: &SqlDialect,
     schema: &SchemaContext,
-) -> Result<Vec<ExtractedResource>> {
+) -> Result<ExtractedStatement> {
     let dialect = dialect_kwarg(src_dialect);
     let schema_json = schema_to_json(schema);
     Python::attach(|py| extract_resources_gil(py, sql, &dialect, &schema_json))
@@ -135,13 +167,14 @@ pub fn rewrite_table_scans(
 }
 
 fn schema_to_json(schema: &SchemaContext) -> String {
-    // { "table_name": ["col1", "col2", ...] }
-    let map: std::collections::BTreeMap<&String, Vec<&String>> = schema
-        .tables
-        .iter()
-        .map(|(t, cols)| (t, cols.keys().collect()))
-        .collect();
-    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+    // { "table_name": { "col1": "type1", ... } } — sqlglot's `qualify(schema=...)`
+    // requires this nesting (a dict of column -> type per table); handing it a
+    // flat list of column names raises `SchemaError: ... must match the schema's
+    // nesting level` internally, which `extract_resources` silently swallows and
+    // treats as "no schema", so column attribution never actually runs.
+    // `rewrite_table_scans`'s own `list(cols)` still works unchanged against this
+    // shape — `list()` on a dict yields its keys, the column names it wants.
+    serde_json::to_string(&schema.tables).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn policies_to_json(policies: &[TablePolicy]) -> String {
@@ -191,11 +224,33 @@ def _qualified(t):
     return (db + "." + t.name) if db else t.name
 
 
+def _write_target(tree):
+    """(write-target Table node or None, whether the statement embeds reads).
+
+    `INSERT INTO t ...`, `UPDATE t ...`, `DELETE FROM t ...`, `MERGE INTO t ...` and
+    `CREATE TABLE/VIEW t AS <query>` write to `t`; every *other* table they mention is
+    read. Statements that only name a table without reading it (`DESCRIBE`, `DROP`,
+    `ALTER`, ...) embed no reads.
+    """
+    if isinstance(tree, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+        node = tree.this
+    elif isinstance(tree, exp.Create) and isinstance(tree.args.get("expression"), exp.Query):
+        node = tree.this
+    else:
+        return None, isinstance(tree, exp.Query)
+    if isinstance(node, exp.Schema):
+        node = node.this
+    return (node if isinstance(node, exp.Table) else None), True
+
+
 def extract_resources(sql, dialect, schema_json):
     schema = json.loads(schema_json) if schema_json else {}
     # A parse failure must surface as an error, never as "no tables": the backend engine may
     # accept SQL that sqlglot rejects, so an empty result here would let it through unchecked.
-    tree = sqlglot.parse_one(sql, dialect=dialect or None)
+    try:
+        tree = sqlglot.parse_one(sql, dialect=dialect or None)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
     ctes = _cte_names(tree)
 
@@ -207,14 +262,28 @@ def extract_resources(sql, dialect, schema_json):
         except Exception:
             qualified = None
 
+    # Build the table listing from whichever tree we'll also read column
+    # attribution from (`qualified` when we have one, else the raw `tree`).
+    # qualify() renormalizes identifier casing per-dialect (e.g. `Orders` ->
+    # `orders` on Trino, `orders` -> `ORDERS` on Snowflake) and can rewrite an
+    # unaliased table's synthesized alias too — keying the table listing off a
+    # *different* tree than the alias map risks the two keys never matching,
+    # which would silently attribute zero columns to a real, matched table.
+    src = qualified if qualified is not None else tree
+
+    target, embeds_reads = _write_target(src)
+
+    # A write target and a read of the same table (`INSERT INTO t SELECT ... FROM t`) are
+    # tracked as separate entries: the read must still be policy-checked.
     per_table = {}
     order = []
-    for t in tree.find_all(exp.Table):
+    for t in src.find_all(exp.Table):
         if not t.name:
             continue
         if not t.catalog and not t.db and t.name.lower() in ctes:
             continue
-        key = _table_key(t)
+        is_target = t is target
+        key = _table_key(t) + (is_target,)
         if key not in per_table:
             per_table[key] = {
                 "catalog": t.catalog or None,
@@ -222,10 +291,10 @@ def extract_resources(sql, dialect, schema_json):
                 "table": t.name,
                 "columns": set(),
                 "all": False,
+                "target": is_target,
             }
             order.append(key)
 
-    src = qualified if qualified is not None else tree
     # star -> all columns
     for star in src.find_all(exp.Star):
         for e in per_table.values():
@@ -240,7 +309,7 @@ def extract_resources(sql, dialect, schema_json):
         for col in qualified.find_all(exp.Column):
             tbl = col.table
             if tbl and tbl in alias_to_table:
-                k = alias_to_table[tbl]
+                k = alias_to_table[tbl] + (False,)
                 if k in per_table:
                     per_table[k]["columns"].add(col.name)
     else:
@@ -257,8 +326,9 @@ def extract_resources(sql, dialect, schema_json):
             "schema": e["schema"],
             "table": e["table"],
             "columns": cols,
+            "target": e["target"],
         })
-    return json.dumps(out)
+    return json.dumps({"resources": out, "embeds_reads": embeds_reads})
 
 
 def rewrite_table_scans(sql, dialect, schema_json, policies_json):
@@ -266,6 +336,9 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
     policies = json.loads(policies_json)
     tree = sqlglot.parse_one(sql, dialect=dialect or None)
     ctes = _cte_names(tree)
+    # The write target is not a scan site: swapping it for a filtered subquery would
+    # produce invalid SQL (`UPDATE (SELECT ...) AS t ...`) and would not restrict anything.
+    target, _ = _write_target(tree)
 
     # Index policies (lowercased). A qualified policy is only reachable by an unqualified scan
     # through `qualified_by_bare`; an explicitly qualified scan never resolves to another
@@ -294,17 +367,95 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
             )
         return cands[0] if cands else None
 
-    def col_list_for(policy_table, node):
-        # explicit schema columns win; else derive from the scan is impossible -> error
+    def _star_selects_this_scan(table_node):
+        p = table_node.parent
+        while p is not None:
+            if isinstance(p, exp.Select):
+                for e in p.expressions:
+                    if isinstance(e, exp.Star):
+                        return True
+                    if isinstance(e, exp.Column) and e.name == "*":
+                        # `a.*` expands only `a`; other scans in the same SELECT are not starred.
+                        qualifier = (e.table or "").lower()
+                        if not qualifier or qualifier in (
+                            (table_node.alias or "").lower(),
+                            (table_node.name or "").lower(),
+                        ):
+                            return True
+                return False
+            p = p.parent
+        return False
+
+    def _enclosing_select(table_node):
+        p = table_node.parent
+        while p is not None:
+            if isinstance(p, exp.Select):
+                return p
+            p = p.parent
+        return None
+
+    def _in_select_scope(node, select):
+        p = node.parent
+        while p is not None:
+            if isinstance(p, exp.Select):
+                return p is select
+            p = p.parent
+        return False
+
+    def col_list_for(policy_table, node, masks):
+        # explicit schema columns win; else named references in the *enclosing*
+        # SELECT (plus every masked column) are enough for a projection.
+        # Unqualified names are taken only from that SELECT so a join's
+        # `IN (SELECT id FROM t)` still projects `id` on the inner scan.
+        # SELECT * still needs schema — we cannot invent the rest of the table.
         cand = [policy_table.lower(), policy_table.rsplit(".", 1)[-1].lower()]
         for tname, cols in schema.items():
             if tname.lower() in cand or tname.rsplit(".", 1)[-1].lower() in cand:
                 return list(cols)
-        return None
+        if _star_selects_this_scan(node):
+            return None
+        alias = (node.alias or node.name or "").lower()
+        names = []
+        seen = set()
+
+        def add(n):
+            if not n:
+                return
+            k = n.lower()
+            if k not in seen:
+                seen.add(k)
+                names.append(n)
+
+        for mcol in masks:
+            add(mcol)
+        scope = _enclosing_select(node)
+        src = scope if scope is not None else tree
+        sole_in_scope = False
+        if scope is not None:
+            tables_here = [
+                tbl
+                for tbl in scope.find_all(exp.Table)
+                if tbl.name
+                and not (not tbl.catalog and not tbl.db and tbl.name.lower() in ctes)
+                and _in_select_scope(tbl, scope)
+            ]
+            sole_in_scope = len(tables_here) == 1
+        for col in src.find_all(exp.Column):
+            if not col.name or col.name == "*":
+                continue
+            if scope is not None and not _in_select_scope(col, scope):
+                continue
+            tbl = (col.table or "").lower()
+            if tbl:
+                if tbl == alias or tbl in cand:
+                    add(col.name)
+            elif sole_in_scope:
+                add(col.name)
+        return names if names else None
 
     replaced = 0
     for t in list(tree.find_all(exp.Table)):
-        if not t.name:
+        if t is target or not t.name:
             continue
         if not t.catalog and not t.db and t.name.lower() in ctes:
             continue
@@ -319,7 +470,7 @@ def rewrite_table_scans(sql, dialect, schema_json, policies_json):
 
         # projection
         if masks:
-            cols = col_list_for(policy["table"], t)
+            cols = col_list_for(policy["table"], t, masks)
             if not cols:
                 raise ValueError("cannot enumerate columns for masked table %r" % policy["table"])
             selects = []
@@ -360,27 +511,51 @@ fn extract_resources_gil(
     sql: &str,
     dialect: &str,
     schema_json: &str,
-) -> Result<Vec<ExtractedResource>> {
+) -> Result<ExtractedStatement> {
     let module = load_module(py)?;
     let json: String = module
         .getattr("extract_resources")
         .and_then(|f| f.call1((sql, dialect, schema_json)))
         .and_then(|v| v.extract())
         .map_err(|e| QueryFluxError::Translation(format!("extract_resources: {e}")))?;
-    let raw: Vec<RawResource> = serde_json::from_str(&json)
+    let raw: RawOutput = serde_json::from_str(&json)
         .map_err(|e| QueryFluxError::Translation(format!("extract_resources decode: {e}")))?;
-    Ok(raw
-        .into_iter()
-        .map(|r| ExtractedResource {
-            catalog: r.catalog,
-            schema: r.schema,
-            table: r.table,
-            columns: match r.columns {
-                Some(c) => Columns::Named(c),
-                None => Columns::All,
-            },
-        })
-        .collect())
+    match raw {
+        RawOutput::Ok {
+            resources,
+            embeds_reads,
+        } => Ok(ExtractedStatement {
+            resources: resources
+                .into_iter()
+                .map(|r| ExtractedResource {
+                    catalog: r.catalog,
+                    schema: r.schema,
+                    table: r.table,
+                    columns: match r.columns {
+                        Some(c) => Columns::Named(c),
+                        None => Columns::All,
+                    },
+                    is_write_target: r.target,
+                })
+                .collect(),
+            embeds_reads,
+        }),
+        RawOutput::Err { error } => Err(QueryFluxError::Translation(format!(
+            "extract_resources: could not parse SQL: {error}"
+        ))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RawOutput {
+    Ok {
+        resources: Vec<RawResource>,
+        embeds_reads: bool,
+    },
+    Err {
+        error: String,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -389,6 +564,7 @@ struct RawResource {
     schema: Option<String>,
     table: String,
     columns: Option<Vec<String>>,
+    target: bool,
 }
 
 fn rewrite_table_scans_gil(
@@ -464,6 +640,30 @@ mod tests {
         assert_eq!(render_mask(&cust, "s", &d).unwrap(), "upper(s)");
         assert!(render_mask(&cm("s", MaskType::Custom), "s", &d).is_err());
     }
+    /// REDACT must replace *every* alphanumeric — Postgres/DuckDB's 3-arg `regexp_replace`
+    /// replaces only the first match, so those two dialects need the `g` flag; Trino's
+    /// 3-arg form already replaces every match, and a 4th positional argument there is a
+    /// capture-group index, not a flag, so it must be left alone.
+    #[test]
+    fn render_mask_redact_is_global_where_it_needs_to_be() {
+        let redact = cm("s", MaskType::Redact);
+        assert_eq!(
+            render_mask(&redact, "s", &SqlDialect::Postgres).unwrap(),
+            "regexp_replace(s, '[A-Za-z0-9]', 'x', 'g')"
+        );
+        assert_eq!(
+            render_mask(&redact, "s", &SqlDialect::DuckDb).unwrap(),
+            "regexp_replace(s, '[A-Za-z0-9]', 'x', 'g')"
+        );
+        assert_eq!(
+            render_mask(&redact, "s", &SqlDialect::Trino).unwrap(),
+            "regexp_replace(s, '[A-Za-z0-9]', 'x')"
+        );
+        assert_eq!(
+            render_mask(&redact, "s", &SqlDialect::Athena).unwrap(),
+            "regexp_replace(s, '[A-Za-z0-9]', 'x')"
+        );
+    }
 
     #[test]
     fn extract_resources_basic_join() {
@@ -472,9 +672,27 @@ mod tests {
             &SqlDialect::Trino,
             &SchemaContext::default(),
         )
-        .unwrap();
+        .unwrap()
+        .resources;
         let names: std::collections::HashSet<_> = refs.iter().map(|r| r.table.as_str()).collect();
         assert_eq!(names, ["orders", "customers"].into_iter().collect());
+    }
+
+    /// Regression: a genuine parse failure must surface as `Err`, never `Ok(vec![])` — the
+    /// caller (`OpaAccessGuard::check`) only takes its fail-closed `onMissingSchema: deny`
+    /// path on `Err`; conflating a parse failure with "no tables referenced" let an
+    /// unparseable query bypass access control entirely.
+    #[test]
+    fn extract_resources_parse_failure_is_err() {
+        let err = extract_resources(
+            "SELECT FROM FROM (((",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+        );
+        assert!(
+            err.is_err(),
+            "a parse failure must be Err, not Ok(vec![]) — Ok(vec![]) must mean 'no tables'"
+        );
     }
 
     #[test]
@@ -484,11 +702,201 @@ mod tests {
             &SqlDialect::Trino,
             &SchemaContext::default(),
         )
-        .unwrap();
+        .unwrap()
+        .resources;
         assert_eq!(
             refs.iter().map(|r| r.table.as_str()).collect::<Vec<_>>(),
             vec!["base"]
         );
+    }
+
+    /// `(reads, write targets, embeds_reads)` for `sql`, table names sorted.
+    fn split_statement(sql: &str) -> (Vec<String>, Vec<String>, bool) {
+        let st = extract_resources(sql, &SqlDialect::Trino, &SchemaContext::default()).unwrap();
+        let pick = |target: bool| {
+            let mut names: Vec<String> = st
+                .resources
+                .iter()
+                .filter(|r| r.is_write_target == target)
+                .map(|r| r.table.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        (pick(false), pick(true), st.embeds_reads)
+    }
+
+    fn names(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The reads inside a write statement must be reported as reads — otherwise a protected
+    /// table can be copied out via `INSERT … SELECT` / `CREATE TABLE … AS`.
+    #[test]
+    fn extract_resources_separates_reads_from_the_write_target() {
+        for (sql, reads, targets) in [
+            (
+                "INSERT INTO mine (id) SELECT id FROM secret",
+                &["secret"][..],
+                &["mine"][..],
+            ),
+            (
+                "CREATE TABLE copy AS SELECT * FROM secret",
+                &["secret"],
+                &["copy"],
+            ),
+            ("CREATE VIEW v AS SELECT * FROM secret", &["secret"], &["v"]),
+            (
+                "UPDATE t SET x = 1 WHERE id IN (SELECT id FROM secret)",
+                &["secret"],
+                &["t"],
+            ),
+            ("DELETE FROM t WHERE x = 1", &[], &["t"]),
+            ("INSERT INTO t VALUES (1)", &[], &["t"]),
+            (
+                "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = s.x",
+                &["s"],
+                &["t"],
+            ),
+            // A read of the target table itself is still a read.
+            ("INSERT INTO t SELECT * FROM t", &["t"], &["t"]),
+            ("SELECT * FROM orders", &["orders"], &[]),
+        ] {
+            let (r, t, embeds) = split_statement(sql);
+            assert_eq!((r, t), (names(reads), names(targets)), "{sql}");
+            assert!(embeds, "{sql} should embed reads");
+        }
+    }
+
+    /// Statements that merely name a table do not read it and must not be treated as reads.
+    #[test]
+    fn extract_resources_ddl_and_describe_embed_no_reads() {
+        for sql in [
+            "DESCRIBE orders",
+            "DROP TABLE orders",
+            "ALTER TABLE orders ADD COLUMN c INTEGER",
+            "CREATE TABLE orders (id INTEGER)",
+        ] {
+            let (_, _, embeds) = split_statement(sql);
+            assert!(!embeds, "{sql} must not embed reads");
+        }
+    }
+
+    fn policy(table: &str) -> TablePolicy {
+        TablePolicy {
+            table: table.to_string(),
+            row_filters: vec!["x = 1".to_string()],
+            masked_columns: Vec::new(),
+        }
+    }
+
+    /// The write target is not a scan site: replacing it with a filtered subquery would
+    /// emit invalid SQL (`INSERT INTO (SELECT …)`), while the tables it reads still get the
+    /// filter.
+    #[test]
+    fn rewrite_leaves_the_write_target_and_filters_the_reads() {
+        let out = rewrite_table_scans(
+            "INSERT INTO mine SELECT id FROM customers",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[policy("mine"), policy("customers")],
+        )
+        .unwrap()
+        .to_lowercase();
+        assert!(
+            out.starts_with("insert into mine"),
+            "target rewritten: {out}"
+        );
+        assert!(out.contains("from (select"), "read not filtered: {out}");
+        assert!(out.contains("x = 1"), "filter missing: {out}");
+
+        let out = rewrite_table_scans(
+            "UPDATE t SET a = 1 WHERE id IN (SELECT id FROM secret)",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[policy("t"), policy("secret")],
+        )
+        .unwrap()
+        .to_lowercase();
+        assert!(out.starts_with("update t set"), "target rewritten: {out}");
+        assert!(out.contains("x = 1"), "subquery read not filtered: {out}");
+    }
+
+    fn named_columns(columns: &Columns) -> Vec<String> {
+        match columns {
+            Columns::Named(cols) => {
+                let mut cols = cols.clone();
+                cols.sort();
+                cols
+            }
+            Columns::All => panic!("expected an explicit column list, got Columns::All"),
+        }
+    }
+
+    #[test]
+    fn extract_resources_with_schema_attributes_columns() {
+        let schema = schema_with("orders", &["id", "amount", "region"]);
+        let refs = extract_resources(
+            "SELECT o.id, o.amount FROM orders o",
+            &SqlDialect::Trino,
+            &schema,
+        )
+        .unwrap()
+        .resources;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            named_columns(&refs[0].columns),
+            vec!["amount".to_string(), "id".to_string()]
+        );
+    }
+
+    /// Regression: `qualify()` normalizes identifier casing per-dialect (e.g. `Orders`
+    /// -> `orders` on Trino). Column attribution used to key the table listing off the
+    /// pre-qualify tree and the alias map off the post-qualify tree, so any casing
+    /// difference between them silently dropped every column for that table down to an
+    /// empty list — even though a schema was provided and qualify() ran successfully.
+    #[test]
+    fn extract_resources_with_schema_attributes_columns_when_table_case_differs() {
+        let schema = schema_with("orders", &["id", "amount"]);
+        let refs = extract_resources(
+            "SELECT o.id, o.amount FROM Orders o",
+            &SqlDialect::Trino,
+            &schema,
+        )
+        .unwrap()
+        .resources;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            named_columns(&refs[0].columns),
+            vec!["amount".to_string(), "id".to_string()]
+        );
+    }
+
+    /// Regression: Snowflake's default identifier folding uppercases both the table
+    /// name and any unquoted alias during qualify() — for perfectly ordinary,
+    /// all-lowercase source SQL, not just mixed-case edge cases. Column attribution
+    /// must survive it instead of silently reporting zero columns for every Snowflake
+    /// query that has a schema configured.
+    #[test]
+    fn extract_resources_with_schema_attributes_columns_on_snowflake() {
+        let schema = schema_with("orders", &["id", "amount"]);
+        let refs = extract_resources(
+            "SELECT o.id, o.amount FROM orders o",
+            &SqlDialect::Snowflake,
+            &schema,
+        )
+        .unwrap()
+        .resources;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].table.to_lowercase(), "orders");
+        // Snowflake folds unquoted identifiers to uppercase — columns included —
+        // so compare case-insensitively; the point of this test is that the
+        // column list isn't silently empty, not what case it comes back in.
+        let cols: Vec<String> = named_columns(&refs[0].columns)
+            .into_iter()
+            .map(|c| c.to_lowercase())
+            .collect();
+        assert_eq!(cols, vec!["amount".to_string(), "id".to_string()]);
     }
 
     #[test]
@@ -551,9 +959,54 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_masked_table_without_schema_errors() {
+    fn rewrite_mask_named_columns_without_schema() {
+        let out = rewrite_table_scans(
+            "SELECT name, ssn FROM finance.transactions ORDER BY id",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[TablePolicy {
+                table: "finance.transactions".into(),
+                row_filters: vec!["region = 'EU'".into()],
+                masked_columns: vec![("ssn".into(), "NULL".into())],
+            }],
+        )
+        .unwrap();
+        let lower = out.to_lowercase();
+        assert!(lower.contains("null"), "got: {out}");
+        assert!(lower.contains("region = 'eu'"), "got: {out}");
+        assert!(
+            lower.contains("as ssn") || lower.contains("ssn"),
+            "masked column must stay addressable: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrite_mask_in_subquery_projects_unqualified_id() {
+        let out = rewrite_table_scans(
+            "SELECT a.id, b.id FROM customers a \
+             JOIN customers b ON a.id < b.id \
+             WHERE a.id IN (SELECT id FROM customers)",
+            &SqlDialect::Trino,
+            &SchemaContext::default(),
+            &[TablePolicy {
+                table: "customers".into(),
+                row_filters: vec!["region = 'EU'".into()],
+                masked_columns: vec![("ssn".into(), "NULL".into())],
+            }],
+        )
+        .unwrap();
+        let lower = out.to_lowercase();
+        assert!(
+            lower.contains("in (select id from"),
+            "IN subquery must keep projecting id, got: {out}"
+        );
+        assert!(lower.contains("null"), "mask must still apply: {out}");
+    }
+
+    #[test]
+    fn rewrite_masked_star_without_schema_errors() {
         let err = rewrite_table_scans(
-            "SELECT ssn FROM finance.transactions",
+            "SELECT * FROM finance.transactions",
             &SqlDialect::Trino,
             &SchemaContext::default(),
             &[TablePolicy {
@@ -563,6 +1016,45 @@ mod tests {
             }],
         );
         assert!(err.is_err());
+    }
+
+    /// `a.*` expands only `a`. With no schema, a masked table that is joined but not starred
+    /// can still be rewritten from its named references; one that *is* starred (by alias or
+    /// by name) can't, and must be refused rather than leak the unmasked column.
+    #[test]
+    fn rewrite_qualified_star_only_applies_to_its_own_scan() {
+        let policy = || {
+            vec![TablePolicy {
+                table: "finance.transactions".into(),
+                row_filters: vec![],
+                masked_columns: vec![("ssn".into(), "NULL".into())],
+            }]
+        };
+        let run = |sql: &str| {
+            rewrite_table_scans(
+                sql,
+                &SqlDialect::Trino,
+                &SchemaContext::default(),
+                &policy(),
+            )
+        };
+
+        let out = run("SELECT a.* FROM other a JOIN finance.transactions b ON a.id = b.id")
+            .expect("a.* does not star the masked table");
+        assert!(
+            out.to_lowercase().contains("null"),
+            "mask must apply: {out}"
+        );
+
+        for starred in [
+            "SELECT b.* FROM other a JOIN finance.transactions b ON a.id = b.id",
+            "SELECT t.* FROM finance.transactions t",
+            "SELECT transactions.* FROM finance.transactions",
+            "SELECT a.*, b.* FROM other a JOIN finance.transactions b ON a.id = b.id",
+            "SELECT * FROM other a JOIN finance.transactions b ON a.id = b.id",
+        ] {
+            assert!(run(starred).is_err(), "must fail closed: {starred}");
+        }
     }
 
     #[test]
