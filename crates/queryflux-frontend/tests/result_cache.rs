@@ -7,7 +7,7 @@ use arrow::{
 use async_trait::async_trait;
 use queryflux_auth::{
     AllowAllAuthorization, AuthContext, AuthProvider, AuthorizationChecker,
-    BackendIdentityResolver, NoneAuthProvider,
+    BackendIdentityResolver, NoneAuthProvider, QueryAction, QueryAuthz,
 };
 use queryflux_cache::{opendal_cache::OpenDalResultCache, CacheKey, QueryResultCache};
 use queryflux_cluster_manager::{cluster_state::ClusterState, simple::SimpleClusterGroupManager};
@@ -30,7 +30,10 @@ use queryflux_persistence::{cache_store::CacheStore, in_memory::InMemoryPersiste
 use queryflux_routing::chain::RouterChain;
 use queryflux_translation::TranslationService;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 use tokio::sync::RwLock;
 
 #[derive(Default)]
@@ -451,6 +454,109 @@ async fn unrelated_group_fixups_preserve_cache_hits() {
     assert!(f.cached(sql).await);
     assert_eq!(f.scalar(sql).await, 42);
     assert_eq!(f.hits(), 1);
+}
+
+/// Reload scripts exactly after dispatch snapshots configuration, without timing races.
+struct ReloadFixupsOnAuthorize {
+    live: Weak<RwLock<LiveConfig>>,
+    scripts: Vec<String>,
+}
+
+#[async_trait]
+impl AuthorizationChecker for ReloadFixupsOnAuthorize {
+    /// Apply one reload before allowing the request to continue to cache lookup/setup.
+    async fn check(&self, _: &AuthContext, group: &str) -> bool {
+        let live = self.live.upgrade().unwrap();
+        let mut live = live.write().await;
+        live.group_translation_scripts
+            .insert(group.into(), self.scripts.clone());
+        live.authorization = Arc::new(AllowAllAuthorization::default());
+        true
+    }
+
+    /// Query ownership checks are unrelated to this execution-only fixture.
+    async fn check_query(&self, _: &AuthContext, _: QueryAction, _: &QueryAuthz) -> bool {
+        true
+    }
+}
+
+/// Adding/removing scripts mid-request must not mix cache eligibility and execution states.
+#[tokio::test]
+async fn group_fixup_reload_preserves_request_snapshot() {
+    for initially_configured in [false, true] {
+        let mut f = Fixture::new().await;
+        Arc::get_mut(&mut f.state).unwrap().translation =
+            Arc::new(TranslationService::new_sqlglot(vec![]).unwrap());
+        f.session.extra.insert("dialect".into(), "duckdb".into());
+        let scripts =
+            vec!["def transform(sql, src, dst): return 'SELECT CAST(99 AS BIGINT)'".into()];
+        {
+            let mut live = f.state.live.write().await;
+            if initially_configured {
+                live.group_translation_scripts
+                    .insert("duckdb".into(), scripts.clone());
+            }
+            live.authorization = Arc::new(ReloadFixupsOnAuthorize {
+                live: Arc::downgrade(&f.state.live),
+                scripts: if initially_configured {
+                    vec![]
+                } else {
+                    scripts
+                },
+            });
+        }
+        let sql = "SELECT CAST(42 AS BIGINT)";
+        let first = f.scalar(sql).await;
+        assert_eq!(f.hits(), 0);
+        assert_eq!(f.cached(sql).await, !initially_configured);
+        // Once scripts are removed, no script-produced result may be replayed.
+        f.state.live.write().await.group_translation_scripts.clear();
+        assert_eq!(f.scalar(sql).await, 42, "reload must not poison the cache");
+        assert_eq!(f.scalar(sql).await, 42);
+        assert_eq!(f.hits(), if initially_configured { 1 } else { 2 });
+        assert_eq!(first, if initially_configured { 99 } else { 42 });
+    }
+}
+
+/// MCP without a declared dialect skips scripts and can still store/replay cached reads.
+#[tokio::test]
+async fn mcp_without_dialect_preserves_cache_with_fixups() {
+    for global in [false, true] {
+        for hinted in [false, true] {
+            for seeded in [false, true] {
+                let mut f = Fixture::new().await;
+                let scripts =
+                    vec!["def transform(sql, src, dst): return 'SELECT CAST(99 AS BIGINT)'".into()];
+                Arc::get_mut(&mut f.state).unwrap().translation = Arc::new(
+                    TranslationService::new_sqlglot(if global { scripts.clone() } else { vec![] })
+                        .unwrap(),
+                );
+                if !global {
+                    f.state
+                        .live
+                        .write()
+                        .await
+                        .group_translation_scripts
+                        .insert("duckdb".into(), scripts);
+                }
+                if hinted {
+                    f.state.live.write().await.group_cache_settings.clear();
+                    f.session
+                        .extra
+                        .insert("x-queryflux-cache".into(), "true".into());
+                }
+                let sql = "SELECT CAST(42 AS BIGINT)";
+                if seeded {
+                    f.seed(sql).await;
+                }
+                let expected = if seeded { 999 } else { 42 };
+                assert_eq!(f.scalar(sql).await, expected);
+                assert!(f.cached(sql).await);
+                assert_eq!(f.scalar(sql).await, expected);
+                assert_eq!(f.hits(), if seeded { 2 } else { 1 });
+            }
+        }
+    }
 }
 
 /// Reject caching for mixed batches regardless of whether the write comes first or last.

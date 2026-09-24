@@ -1437,6 +1437,8 @@ impl From<SyncOutcome> for QueryOutcome {
 /// `SyncQuerySetup.params` is left empty so the adapter receives no raw params.
 ///
 /// Failures before slot acquisition (no adapter) return Err without recording.
+/// `group_fixups` is the same request snapshot used for result-cache eligibility.
+#[allow(clippy::too_many_arguments)]
 async fn setup_sync_query(
     state: &Arc<AppState>,
     sql: String,
@@ -1445,17 +1447,11 @@ async fn setup_sync_query(
     protocol: FrontendProtocol,
     group: ClusterGroupName,
     auth_ctx: &AuthContext,
+    group_fixups: &[String],
 ) -> Result<SyncQuerySetup> {
     let query_id = ProxyQueryId::new();
 
-    let (
-        cluster_manager,
-        group_fixups,
-        group_default_tags,
-        wait_timeout_secs,
-        catalog,
-        access_control_guard,
-    ) = {
+    let (cluster_manager, group_default_tags, wait_timeout_secs, catalog, access_control_guard) = {
         let live = state.live.read().await;
         let wait_timeout_secs = live
             .group_capacity_wait_timeout_secs
@@ -1464,10 +1460,6 @@ async fn setup_sync_query(
             .unwrap_or(queryflux_core::config::DEFAULT_CAPACITY_WAIT_TIMEOUT_SECS);
         (
             live.cluster_manager.clone(),
-            live.group_translation_scripts
-                .get(&group.0)
-                .cloned()
-                .unwrap_or_default(),
             live.group_default_tags
                 .get(&group.0)
                 .cloned()
@@ -1672,7 +1664,7 @@ async fn setup_sync_query(
                 &src_dialect,
                 &tgt_dialect,
                 &schema_context,
-                &group_fixups,
+                group_fixups,
             )
             .await
         {
@@ -2230,7 +2222,7 @@ pub async fn execute_to_sink(
         cache_cfg,
         access_control_guard,
         catalog,
-        has_group_fixups,
+        group_fixups,
     ) = {
         let live = state.live.read().await;
         (
@@ -2242,7 +2234,8 @@ pub async fn execute_to_sink(
             live.catalog.clone(),
             live.group_translation_scripts
                 .get(&group.0)
-                .is_some_and(|scripts| !scripts.is_empty()),
+                .cloned()
+                .unwrap_or_default(),
         )
     };
 
@@ -2258,21 +2251,22 @@ pub async fn execute_to_sink(
     let cache_hint = queryflux_cache::extract_cache_hint(&sql, &session);
     let effective_cache = cache_cfg.or_else(|| cache_hint.as_ref().map(|h| h.to_group_config()));
     // Fixups can introduce side effects or nondeterminism absent from the client SQL.
-    // Bypass both cache lookup and storage until the executed SQL can be classified.
-    let cache_eligible =
-        if effective_cache.is_some() && !has_group_fixups && !state.translation.has_global_fixups()
-        {
-            let sql = sql.clone();
-            let dialect =
-                queryflux_fingerprint::polyglot_dialect(&resolve_src_dialect(&session, &protocol));
-            // The parser uses a large-stack pool, but waiting on that pool is
-            // synchronous. Keep both classification and determinism off Tokio workers.
-            tokio::task::spawn_blocking(move || queryflux_cache::is_cacheable(&sql, &dialect))
-                .await
-                .unwrap_or(false)
-        } else {
-            false
-        };
+    // Exclude them only when translation runs, and pass this same script snapshot to
+    // execution so a reload cannot change the SQL after cache eligibility is decided.
+    let fixups_can_run = should_attempt_translation(&session, &protocol)
+        && (!group_fixups.is_empty() || state.translation.has_global_fixups());
+    let cache_eligible = if effective_cache.is_some() && !fixups_can_run {
+        let sql = sql.clone();
+        let dialect =
+            queryflux_fingerprint::polyglot_dialect(&resolve_src_dialect(&session, &protocol));
+        // The parser uses a large-stack pool, but waiting on that pool is
+        // synchronous. Keep both classification and determinism off Tokio workers.
+        tokio::task::spawn_blocking(move || queryflux_cache::is_cacheable(&sql, &dialect))
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
     let cache_key = cache_eligible
         .then(|| queryflux_cache::CacheKey::new(&sql, &group.0, &session, &auth_ctx.user, &params));
     // Set inside the `cache_key` block below when access control rewrites the query (row
@@ -2472,6 +2466,7 @@ pub async fn execute_to_sink(
             &mut tee,
             guard_chain,
             group_guard_chain,
+            &group_fixups,
         )
         .await;
         tee.finalize_cache(result.is_ok()).await;
@@ -2491,6 +2486,7 @@ pub async fn execute_to_sink(
             sink,
             guard_chain,
             group_guard_chain,
+            &group_fixups,
         )
         .await
     }
@@ -2530,6 +2526,7 @@ async fn execute_to_sink_inner(
     sink: &mut impl ResultSink,
     guard_chain: Option<Arc<GuardChain>>,
     group_guard_chain: Option<Arc<GuardChain>>,
+    group_fixups: &[String],
 ) -> Result<()> {
     let mut setup = match setup_sync_query(
         state,
@@ -2539,6 +2536,7 @@ async fn execute_to_sink_inner(
         protocol.clone(),
         group,
         auth_ctx,
+        group_fixups,
     )
     .await
     {
@@ -2922,6 +2920,7 @@ mod capacity_wait_tests {
             FrontendProtocol::TrinoHttp,
             ClusterGroupName("default".into()),
             &auth,
+            &[],
         )
         .await;
         assert!(
