@@ -375,6 +375,84 @@ async fn deterministic_selects_still_hit_cache() {
     }
 }
 
+/// Both configuration scopes can turn a deterministic read into a sequence advance.
+async fn assert_translation_fixups_bypass_cache(global: bool) {
+    for hinted in [false, true] {
+        for seeded in [false, true] {
+            let mut f = Fixture::new().await;
+            f.run("CREATE SEQUENCE cache_fixup_seq START 1").await;
+            let script =
+                "def transform(sql, src, dst):\n    return \"SELECT nextval('cache_fixup_seq')\"";
+            let scripts = if global { vec![script.into()] } else { vec![] };
+            Arc::get_mut(&mut f.state).unwrap().translation =
+                Arc::new(TranslationService::new_sqlglot(scripts).unwrap());
+            f.session.extra.insert("dialect".into(), "duckdb".into());
+            if !global {
+                f.state
+                    .live
+                    .write()
+                    .await
+                    .group_translation_scripts
+                    .insert("duckdb".into(), vec![script.into()]);
+            }
+            if hinted {
+                f.state.live.write().await.group_cache_settings.clear();
+                f.session
+                    .extra
+                    .insert("x-queryflux-cache".into(), "true".into());
+            }
+            let sql = "SELECT 1";
+            if seeded {
+                f.seed(sql).await;
+            }
+            assert_eq!(
+                f.scalar(sql).await,
+                1,
+                "global={global}, hinted={hinted}, seeded={seeded}"
+            );
+            assert_eq!(
+                f.scalar(sql).await,
+                2,
+                "each request must advance the sequence"
+            );
+            assert_eq!(f.hits(), 0);
+            if !seeded {
+                assert!(!f.cached(sql).await, "fixup results must not be stored");
+            }
+        }
+    }
+}
+
+/// Group fixups bypass fresh and seeded entries, including when hints enable caching.
+#[tokio::test]
+async fn group_translation_fixups_bypass_cache() {
+    assert_translation_fixups_bypass_cache(false).await;
+}
+
+/// Global fixups obey the same cache bypass as group-specific scripts.
+#[tokio::test]
+async fn global_translation_fixups_bypass_cache() {
+    assert_translation_fixups_bypass_cache(true).await;
+}
+
+/// Fixups on another group must not disable this group's deterministic read cache.
+#[tokio::test]
+async fn unrelated_group_fixups_preserve_cache_hits() {
+    let mut f = Fixture::new().await;
+    Arc::get_mut(&mut f.state).unwrap().translation =
+        Arc::new(TranslationService::new_sqlglot(vec![]).unwrap());
+    f.session.extra.insert("dialect".into(), "duckdb".into());
+    f.state.live.write().await.group_translation_scripts.insert(
+        "another-group".into(),
+        vec!["def transform(sql, src, dst): return sql".into()],
+    );
+    let sql = "SELECT CAST(42 AS BIGINT)";
+    assert_eq!(f.scalar(sql).await, 42);
+    assert!(f.cached(sql).await);
+    assert_eq!(f.scalar(sql).await, 42);
+    assert_eq!(f.hits(), 1);
+}
+
 /// Reject caching for mixed batches regardless of whether the write comes first or last.
 #[tokio::test]
 async fn mixed_read_write_batches_bypass_lookup_and_storage() {

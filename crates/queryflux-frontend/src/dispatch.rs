@@ -2223,7 +2223,15 @@ pub async fn execute_to_sink(
     sink: &mut impl ResultSink,
     auth_ctx: &AuthContext,
 ) -> Result<()> {
-    let (authorization, guard_chain, group_guard_chain, cache_cfg, access_control_guard, catalog) = {
+    let (
+        authorization,
+        guard_chain,
+        group_guard_chain,
+        cache_cfg,
+        access_control_guard,
+        catalog,
+        has_group_fixups,
+    ) = {
         let live = state.live.read().await;
         (
             live.authorization.clone(),
@@ -2232,6 +2240,9 @@ pub async fn execute_to_sink(
             live.group_cache_settings.get(&group.0).cloned(),
             live.access_control_guard.clone(),
             live.catalog.clone(),
+            live.group_translation_scripts
+                .get(&group.0)
+                .is_some_and(|scripts| !scripts.is_empty()),
         )
     };
 
@@ -2246,18 +2257,22 @@ pub async fn execute_to_sink(
     // --- Query result cache: check for hit before acquiring a cluster slot ---
     let cache_hint = queryflux_cache::extract_cache_hint(&sql, &session);
     let effective_cache = cache_cfg.or_else(|| cache_hint.as_ref().map(|h| h.to_group_config()));
-    let cache_eligible = if effective_cache.is_some() {
-        let sql = sql.clone();
-        let dialect =
-            queryflux_fingerprint::polyglot_dialect(&resolve_src_dialect(&session, &protocol));
-        // The parser uses a large-stack pool, but waiting on that pool is
-        // synchronous. Keep both classification and determinism off Tokio workers.
-        tokio::task::spawn_blocking(move || queryflux_cache::is_cacheable(&sql, &dialect))
-            .await
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    // Fixups can introduce side effects or nondeterminism absent from the client SQL.
+    // Bypass both cache lookup and storage until the executed SQL can be classified.
+    let cache_eligible =
+        if effective_cache.is_some() && !has_group_fixups && !state.translation.has_global_fixups()
+        {
+            let sql = sql.clone();
+            let dialect =
+                queryflux_fingerprint::polyglot_dialect(&resolve_src_dialect(&session, &protocol));
+            // The parser uses a large-stack pool, but waiting on that pool is
+            // synchronous. Keep both classification and determinism off Tokio workers.
+            tokio::task::spawn_blocking(move || queryflux_cache::is_cacheable(&sql, &dialect))
+                .await
+                .unwrap_or(false)
+        } else {
+            false
+        };
     let cache_key = cache_eligible
         .then(|| queryflux_cache::CacheKey::new(&sql, &group.0, &session, &auth_ctx.user, &params));
     // Set inside the `cache_key` block below when access control rewrites the query (row
