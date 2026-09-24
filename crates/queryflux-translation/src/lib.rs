@@ -140,6 +140,7 @@ impl TranslationService {
     /// Translate `sql` from `src` to `tgt` if they differ.
     /// Compatible dialects without fixups bypass translation. Required translation
     /// failures follow the configured policy (best-effort passthrough or strict rejection).
+    /// Fixup statement-kind violations always reject, regardless of policy.
     ///
     /// `group_fixups` are appended after global YAML `translation.pythonScripts` (same contract).
     pub async fn maybe_translate(
@@ -181,6 +182,7 @@ impl TranslationService {
             Err(sqlglot::SqlglotFailure {
                 error: QueryFluxError::Translation("required translation unavailable: sqlglot is not installed or could not be imported".into()),
                 reason: TranslationReason::SqlglotUnavailable,
+                reject_passthrough: false,
             })
         };
         match result {
@@ -196,7 +198,7 @@ impl TranslationService {
                 },
             },
             Err(failure) => TranslationReport {
-                result: if strict {
+                result: if strict || failure.reject_passthrough {
                     Err(failure.error)
                 } else {
                     Ok(sql.to_string())

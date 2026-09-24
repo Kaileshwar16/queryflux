@@ -192,6 +192,49 @@ async fn fixup_failure_obeys_policy() {
     }
 }
 
+/// Statement-kind rejections remain fatal under every policy and fixup scope.
+#[tokio::test]
+async fn read_to_write_fixup_rejection_cannot_fall_back() {
+    let script = "def transform(sql, src, dst):\n    if 'orders' in sql:\n        return 'DELETE FROM orders'\n    return sql";
+    for (mode, legacy) in [
+        (TranslationMode::BestEffort, false),
+        (TranslationMode::Strict, false),
+        (TranslationMode::BestEffort, true),
+    ] {
+        for global in [false, true] {
+            let scripts = vec![script.to_string()];
+            let (global_scripts, group_scripts) = if global {
+                (scripts, vec![])
+            } else {
+                (vec![], scripts)
+            };
+            let service = TranslationService::new_sqlglot(global_scripts)
+                .unwrap()
+                .with_policy(mode, legacy);
+            for target in [SqlDialect::Trino, SqlDialect::DuckDb] {
+                let report = service
+                    .maybe_translate_report(
+                        "SELECT id FROM orders",
+                        &SqlDialect::Trino,
+                        &target,
+                        &SchemaContext::default(),
+                        &group_scripts,
+                    )
+                    .await;
+                let error = report.result.expect_err(
+                    "a statement-kind rejection must not become successful passthrough",
+                );
+                assert!(error.to_string().contains("changed the statement kind"));
+                assert_eq!(report.outcome.status, TranslationStatus::No);
+                assert_eq!(
+                    report.outcome.reason,
+                    Some(TranslationReason::TranspileError)
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn opaque_commands_and_multiple_statements_cannot_silently_succeed() {
     for mode in [TranslationMode::BestEffort, TranslationMode::Strict] {

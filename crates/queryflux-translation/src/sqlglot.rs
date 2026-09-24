@@ -129,10 +129,12 @@ fn extract_table_refs_with_gil(py: Python<'_>, sql: &str, dialect: &str) -> Resu
     Ok(refs)
 }
 
-/// Keep import failures distinct without parsing Python error text.
+/// Keep failure reasons and nonrecoverable rejections distinct without parsing error text.
 pub(crate) struct SqlglotFailure {
     pub error: QueryFluxError,
     pub reason: TranslationReason,
+    /// Invariant violations must reject the request even under best-effort policy.
+    pub reject_passthrough: bool,
 }
 
 impl From<QueryFluxError> for SqlglotFailure {
@@ -140,6 +142,7 @@ impl From<QueryFluxError> for SqlglotFailure {
         Self {
             error,
             reason: TranslationReason::TranspileError,
+            reject_passthrough: false,
         }
     }
 }
@@ -210,7 +213,8 @@ impl SqlglotTranslator {
 pub fn validate_fixup_script(script: &str) -> Result<()> {
     Python::attach(|py| run_fixup_scripts(py, "SELECT 1", "trino", "trino", &[script.to_string()]))
         .map(|_| ())
-        .map_err(|e| {
+        .map_err(|failure| {
+            let e = failure.error;
             QueryFluxError::Translation(format!(
                 "fixup script failed validation against the current transform(sql: str, src: \
                  str, dst: str) -> str contract (a script written for the old \
@@ -249,6 +253,7 @@ fn translate_with_gil(
         let sqlglot = PyModule::import(py, "sqlglot").map_err(|e| SqlglotFailure {
             error: QueryFluxError::Translation(format!("Failed to import sqlglot: {e}")),
             reason: TranslationReason::SqlglotUnavailable,
+            reject_passthrough: false,
         })?;
 
         // sqlglot can accept unknown syntax as an opaque Command even with
@@ -475,7 +480,7 @@ fn run_fixup_scripts(
     src: &str,
     tgt: &str,
     scripts: &[String],
-) -> Result<String> {
+) -> std::result::Result<String, SqlglotFailure> {
     let dialect = SqlDialect::Sqlglot(tgt.to_string());
     let mut current = sql.to_string();
 
@@ -522,9 +527,13 @@ fn run_fixup_scripts(
 
         let read_like_after = queryflux_core::sql_classify::is_read_like_sql(&current, &dialect);
         if read_like_before && !read_like_after {
-            return Err(QueryFluxError::Translation(format!(
-                "translation script {i} changed the statement kind from read to non-read; rejected"
-            )));
+            return Err(SqlglotFailure {
+                error: QueryFluxError::Translation(format!(
+                    "translation script {i} changed the statement kind from read to non-read; rejected"
+                )),
+                reason: TranslationReason::TranspileError,
+                reject_passthrough: true,
+            });
         }
     }
 
