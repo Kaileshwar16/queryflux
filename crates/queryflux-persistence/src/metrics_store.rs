@@ -42,6 +42,9 @@ pub struct QueryRecord {
     pub frontend_protocol: FrontendProtocol,
     pub source_dialect: SqlDialect,
     pub target_dialect: SqlDialect,
+    pub was_rewritten: bool,
+    /// Source-dialect SQL after access-control rewrite. Only set when `was_rewritten` is true.
+    pub rewritten_sql: Option<String>,
     pub was_translated: bool,
     /// Translation stage outcome. None when the stage was not reached.
     pub translation: Option<queryflux_core::query::TranslationOutcome>,

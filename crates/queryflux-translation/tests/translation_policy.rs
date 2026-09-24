@@ -167,13 +167,13 @@ async fn schema_outcomes_are_independent_of_text_changes_and_strictness() {
 async fn fixup_failure_obeys_policy() {
     for mode in [TranslationMode::BestEffort, TranslationMode::Strict] {
         let service = TranslationService::new_sqlglot(vec![
-            "def transform(ast, src, dst):\n    raise ValueError('broken fixup')".into(),
+            "def transform(sql, src, dst):\n    if 'orders' in sql:\n        raise ValueError('broken fixup')\n    return sql".into(),
         ])
         .unwrap()
         .with_policy(mode, false);
         let report = service
             .maybe_translate_report(
-                "select 1",
+                "select id from orders",
                 &SqlDialect::Trino,
                 &SqlDialect::Trino,
                 &SchemaContext::default(),
@@ -187,7 +187,7 @@ async fn fixup_failure_obeys_policy() {
         if mode == TranslationMode::Strict {
             assert!(report.result.is_err());
         } else {
-            assert_eq!(report.result.unwrap(), "select 1");
+            assert_eq!(report.result.unwrap(), "select id from orders");
         }
     }
 }
@@ -278,7 +278,7 @@ async fn statement_trivia_survives_schema_translation_and_same_dialect_fixups() 
         (
             SqlDialect::Trino,
             SchemaContext::default(),
-            vec!["def transform(ast, src, dst): pass".into()],
+            vec!["def transform(sql, src, dst): return sql".into()],
         ),
     ] {
         let report = service
