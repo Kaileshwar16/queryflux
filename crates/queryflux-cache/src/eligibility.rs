@@ -34,9 +34,12 @@ fn is_query(expr: &Expression) -> bool {
 /// Reject side effects, nondeterministic clauses, and unsupported nodes anywhere in the AST.
 fn safe_tree(expr: &Expression) -> bool {
     // DfsIter visits CTE bodies and set operands, so checking only the root is
-    // insufficient. It does not visit every field/variant in polyglot 0.3.2:
-    // inspect those explicitly or conservatively decline caching. An allowlist
-    // also keeps new/opaque AST kinds from silently becoming cacheable.
+    // insufficient. Audited against polyglot-sql 0.9.2: DfsIter::next delegates
+    // to ast_children::for_each_child and the generated AstNode visitors, which
+    // include LIKE/ILIKE escape, CAST format/default, and aggregate filters.
+    // The explicit recursive checks below are retained as defensive rechecks,
+    // not workarounds for traversal gaps in 0.9.2. The allowlist and clause
+    // restrictions conservatively keep unsupported syntax from being cached.
     DfsIter::new(expr).all(|node| match node {
         Expression::Select(s) => {
             s.into.is_none()
@@ -81,7 +84,7 @@ fn safe_tree(expr: &Expression) -> bool {
         Expression::Cast(c) => {
             c.format.iter().all(|e| safe_tree(e)) && c.default.iter().all(|e| safe_tree(e))
         }
-        // DfsIter visits the operands, but not the optional ESCAPE expression.
+        // Defensively recheck ESCAPE, which DfsIter also visits in 0.9.2.
         Expression::Like(op) | Expression::ILike(op) => op.escape.iter().all(safe_tree),
         Expression::Count(c) => c.this.iter().chain(c.filter.iter()).all(safe_tree),
         Expression::Sum(a) | Expression::Avg(a) | Expression::Min(a) | Expression::Max(a) => {
@@ -230,6 +233,59 @@ mod tests {
             "SELECT 'a' LIKE 'a' ESCAPE unknown_udf()",
             "postgresql"
         ));
+    }
+
+    /// Verify the audited traversal fields and cache policy after successful parsing.
+    #[test]
+    fn traversal_covers_optional_expressions() {
+        for (sql, dialect, safe_value) in [
+            (
+                "SELECT 'a' LIKE 'a' ESCAPE unknown_udf()",
+                "postgresql",
+                "'!'",
+            ),
+            (
+                "SELECT 'a' ILIKE 'a' ESCAPE unknown_udf()",
+                "postgresql",
+                "'!'",
+            ),
+            (
+                "SELECT CAST(1 AS STRING FORMAT unknown_udf())",
+                "bigquery",
+                "'999'",
+            ),
+            (
+                "SELECT CAST('1' AS INT DEFAULT unknown_udf() ON CONVERSION ERROR)",
+                "oracle",
+                "0",
+            ),
+            (
+                "SELECT COUNT(*) FILTER (WHERE unknown_udf()) FROM t",
+                "postgresql",
+                "TRUE",
+            ),
+            (
+                "SELECT SUM(id) FILTER (WHERE unknown_udf()) FROM t",
+                "postgresql",
+                "TRUE",
+            ),
+        ] {
+            queryflux_core::polyglot_pool::run(move || {
+                let statements = polyglot_sql::parse_by_name(sql, dialect).unwrap();
+                assert_eq!(statements.len(), 1, "{sql}");
+                assert!(is_query(&statements[0]), "read root: {sql}");
+                assert!(
+                    DfsIter::new(&statements[0])
+                        .any(|node| matches!(node, Expression::Function(_))),
+                    "DfsIter must reach unknown_udf in the optional field: {sql}"
+                );
+                assert!(!safe_tree(&statements[0]), "unsafe optional field: {sql}");
+            })
+            .expect("AST check on the parser's large-stack pool");
+            assert!(!is_cacheable(sql, dialect), "{sql}");
+            let safe_sql = sql.replace("unknown_udf()", safe_value);
+            assert!(is_cacheable(&safe_sql, dialect), "{safe_sql}");
+        }
     }
 
     /// Verify AST traversal rejects nested writes without relying on parser failure.
