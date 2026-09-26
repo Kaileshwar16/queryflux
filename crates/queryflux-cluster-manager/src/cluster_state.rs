@@ -99,8 +99,26 @@ impl ClusterState {
         self.queued_queries.store(count, Ordering::Relaxed);
     }
 
-    pub fn increment_running(&self) {
-        self.running_queries.fetch_add(1, Ordering::Relaxed);
+    pub fn try_increment_running(&self) -> bool {
+        let mut current = self.running_queries.load(Ordering::Relaxed);
+
+        loop {
+            let max = self.max_running_queries.load(Ordering::Relaxed);
+
+            if current >= max {
+                return false;
+            }
+
+            match self.running_queries.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Never wraps: extra releases (e.g. after restart when persistence still has executing rows
@@ -183,4 +201,48 @@ pub struct ClusterStateSnapshot {
     pub is_healthy: bool,
     /// Whether this cluster is administratively enabled.
     pub enabled: bool,
+}
+
+#[cfg(test)]
+mod capacity_race_probe {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn concurrent_capacity_reservations_do_not_oversubscribe() {
+        const WORKERS: usize = 32;
+
+        let state = Arc::new(ClusterState::new(
+            ClusterName("test-cluster".to_string()),
+            ClusterGroupName("test-group".to_string()),
+            None,
+            None,
+            EngineType::Trino,
+            None,
+            1,
+            true,
+        ));
+
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let mut handles = Vec::new();
+
+        for _ in 0..WORKERS {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                state.try_increment_running()
+            }));
+        }
+
+        let successful = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|success| *success)
+            .count();
+
+        assert_eq!(successful, 1);
+        assert_eq!(state.running_queries(), 1);
+    }
 }

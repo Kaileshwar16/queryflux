@@ -84,6 +84,10 @@ pub struct ProxyConfig {
     /// Omit to disable all guardrails.
     #[serde(default)]
     pub guardrails: Option<GuardrailsConfig>,
+    /// Data-level access control (OPA row filtering, column masking, table/column
+    /// allow-deny). Omit to disable.
+    #[serde(default)]
+    pub access_control: Option<crate::access_config::AccessControlConfig>,
 }
 
 impl ProxyConfig {
@@ -93,6 +97,9 @@ impl ProxyConfig {
         self.authorization.validate()?;
         if let Some(guardrails) = &self.guardrails {
             guardrails.validate()?;
+        }
+        if let Some(access_control) = &self.access_control {
+            access_control.validate()?;
         }
         Ok(())
     }
@@ -476,6 +483,11 @@ pub struct OidcConfig {
     /// JWT claim name for roles (e.g. `"realm_access.roles"` for Keycloak).
     #[serde(default)]
     pub roles_claim: Option<String>,
+    /// JWT claim paths (dot-notation) copied into `AuthContext.attributes` as verified ABAC
+    /// attributes for data-level policy — e.g. `["department", "region", "data_classification"]`.
+    /// Each path's value is stored under its last segment; missing paths are skipped.
+    #[serde(default)]
+    pub attribute_claims: Vec<String>,
 }
 
 fn default_groups_claim() -> String {
@@ -1143,9 +1155,11 @@ pub struct ClusterConfig {
     /// On timeout the proxy calls `StopQueryExecution`.
     #[serde(default)]
     pub max_wait_secs: Option<u64>,
-    /// Max bytes of a single query result QueryFlux buffers in memory
-    /// (`maxResultBufferBytes` in JSON/YAML). ClickHouse only; defaults to
-    /// 1 GiB when omitted. Other engines ignore this.
+    /// Max bytes of buffered query data (`maxResultBufferBytes` in JSON/YAML).
+    /// For ClickHouse Arrow results, this guards bytes consumed between decoded
+    /// batches while the complete result streams. ClickHouse control-plane TSV
+    /// reads and DuckDB buffered results still cap the entire response.
+    /// ClickHouse and DuckDB default to 1 GiB when omitted; other adapters ignore this.
     #[serde(default)]
     pub max_result_buffer_bytes: Option<u64>,
     /// ADBC driver name (e.g. `"snowflake"`, `"flightsql"`) — only meaningful when
@@ -1861,9 +1875,11 @@ pub struct TranslationConfig {
     #[serde(default)]
     pub error_on_unsupported: bool,
     /// Python scripts run after every sqlglot translation.
-    /// Each script must define `def transform(ast, src: str, dst: str) -> None:`.
+    /// Each script must define `def transform(sql: str, src: str, dst: str) -> str:`.
     /// Top-level imports and helper functions are supported.
-    /// Scripts mutate `ast` in-place; `src`/`dst` carry the dialect names.
+    /// Scripts receive the SQL text and return the (possibly modified) SQL text;
+    /// `src`/`dst` carry the dialect names. A script that needs AST-level control
+    /// can `import sqlglot` (or any other parser) itself and return `.sql(dialect=dst)`.
     #[serde(default)]
     pub python_scripts: Vec<String>,
     /// Max time to spend on catalog lookup for schema-aware translation before
@@ -1959,6 +1975,35 @@ pub enum CatalogProviderConfig {
         primary: Box<CatalogProviderConfig>,
         secondary: Box<CatalogProviderConfig>,
     },
+    /// Table/column metadata declared inline in config — for local demos and
+    /// tests without Glue/HMS/Iceberg. Keys are bare table names (`customers`,
+    /// not `catalog.db.customers`).
+    Static {
+        #[serde(default)]
+        tables: StaticTableMap,
+    },
+}
+
+/// `catalogProvider.type: static` — map of bare table name → column list.
+pub type StaticTableMap = std::collections::HashMap<String, StaticTableEntry>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticTableEntry {
+    #[serde(default)]
+    pub catalog: String,
+    #[serde(default)]
+    pub database: String,
+    pub columns: Vec<StaticColumnConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticColumnConfig {
+    pub name: String,
+    pub data_type: String,
+    #[serde(default = "default_true")]
+    pub nullable: bool,
 }
 
 /// Authentication for an `IcebergRest` catalog provider. Maps directly onto
@@ -2001,8 +2046,8 @@ pub enum IcebergRestAuthConfig {
 ///     bucket: my-cache
 ///     endpoint: http://localhost:19000
 ///     region: us-east-1
-///     access_key_id: minio-root-user
-///     secret_access_key: minio-root-password
+///     access_key_id: rustfs-root-user
+///     secret_access_key: rustfs-root-password
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -3220,6 +3265,7 @@ queryflux:
                 audience: None,
                 groups_claim: "groups".into(),
                 roles_claim: None,
+                attribute_claims: vec![],
             }),
             ..Default::default()
         };
@@ -3238,6 +3284,7 @@ queryflux:
                 audience: Some("queryflux".into()),
                 groups_claim: "groups".into(),
                 roles_claim: None,
+                attribute_claims: vec![],
             }),
             ..Default::default()
         };
@@ -3497,6 +3544,31 @@ cache:
                 assert_eq!(cache.max_entries, 10_000);
             }
             other => panic!("expected Glue with defaulted cache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn static_tables_parse_with_camel_case_column_types() {
+        let yaml = r#"
+type: static
+tables:
+  customers:
+    columns:
+      - name: id
+        dataType: INTEGER
+      - name: ssn
+        dataType: VARCHAR
+        nullable: false
+"#;
+        let cfg: CatalogProviderConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            CatalogProviderConfig::Static { tables } => {
+                let customers = tables.get("customers").expect("customers table");
+                assert_eq!(customers.columns.len(), 2);
+                assert_eq!(customers.columns[0].data_type, "INTEGER");
+                assert!(!customers.columns[1].nullable);
+            }
+            other => panic!("expected Static, got {other:?}"),
         }
     }
 }

@@ -12,6 +12,7 @@ use queryflux_cluster_manager::{
 use queryflux_config::{yaml::YamlFileConfigProvider, ConfigProvider};
 use queryflux_core::query::{ClusterGroupName, ClusterName, EngineType};
 use queryflux_frontend::{
+    access_control_guard::OpaAccessGuard,
     admin::{
         build_frontends_status, AdminFrontend, RoutingConfigDto as AdminRoutingConfigDto,
         SecurityConfigDto as AdminSecurityConfigDto, TestCatalogProviderFn, TestClusterFn,
@@ -944,17 +945,24 @@ async fn main() -> Result<()> {
     let cluster_configs = config.clusters.clone();
 
     let group_translation_scripts: HashMap<String, Vec<String>> = if let Some(pg) = &backend {
-        pg.load_group_translation_bodies()
+        let loaded = pg
+            .load_group_translation_bodies()
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("Failed to load group translation scripts from Postgres: {e}");
                 HashMap::new()
-            })
+            });
+        validate_group_translation_scripts(loaded)
     } else {
         HashMap::new()
     };
     let guard_script_bodies =
         load_guard_script_bodies(backend.as_deref().map(|b| b as &dyn AdminStore)).await;
+
+    // --- Build the data access-control guard (OPA row filtering / column masking /
+    // table-column allow-deny), if configured. Runs on the source SQL, before
+    // dialect translation — see `queryflux_frontend::access_control_guard`.
+    let access_control_guard = build_access_control_guard(&config, backend.as_deref()).await?;
 
     // --- Build guard chains: DB-stored config (UI-managed) takes precedence over YAML ---
     // When a persisted config exists in Postgres it is authoritative, even if it
@@ -1031,6 +1039,7 @@ async fn main() -> Result<()> {
         router_chain,
         guard_chain,
         group_guard_chains,
+        access_control_guard,
         cluster_manager,
         adapters,
         health_check_targets,
@@ -1236,6 +1245,7 @@ async fn main() -> Result<()> {
         &config.routers,
     ));
     let catalog_provider_config = Arc::new(config.catalog_provider.clone());
+    let access_control_config = Arc::new(config.access_control.clone());
     let config_reload_notify = Arc::new(tokio::sync::Notify::new());
 
     let frontends_status = build_frontends_status(
@@ -1295,6 +1305,21 @@ async fn main() -> Result<()> {
                 Ok(provider) => provider,
                 Err(e) => return Ok((false, format!("Failed to build provider: {e}"))),
             };
+            if matches!(
+                cfg,
+                queryflux_core::config::CatalogProviderConfig::Static { .. }
+            ) {
+                return match provider.list_tables("", "").await {
+                    Ok(tables) => Ok((
+                        true,
+                        format!("Static catalog — {} table(s) configured", tables.len()),
+                    )),
+                    Err(e) => Ok((
+                        false,
+                        format!("Built static catalog, but listing tables failed: {e}"),
+                    )),
+                };
+            }
             // `list_catalogs()` is a hardcoded synthetic single-entry result for
             // every real provider (Glue/HMS/Iceberg REST have no native "list
             // catalogs" call) — it makes no network call at all, so it can't
@@ -1329,6 +1354,7 @@ async fn main() -> Result<()> {
         security_config,
         routing_config,
         catalog_provider_config,
+        access_control_config,
         engine_registry,
         config_reload_notify.clone(),
         frontends_status,
@@ -1770,6 +1796,7 @@ async fn main() -> Result<()> {
                         authorization: l.authorization.clone(),
                         guard_chain: l.guard_chain.clone(),
                         group_guard_chains: l.group_guard_chains.clone(),
+                        access_control_guard: l.access_control_guard.clone(),
                         catalog: l.catalog.clone(),
                     }
                 };
@@ -1838,6 +1865,22 @@ async fn main() -> Result<()> {
                         Err(e) => {
                             metrics.on_config_reload_failure("catalog_reload");
                             tracing::warn!("Catalog config reload failed: {e}");
+                        }
+                    }
+                    match store.get_proxy_setting("access_control_config").await {
+                        Ok(Some(v)) => match apply_stored_access_control(&v) {
+                            Ok(guard) => {
+                                live.write().await.access_control_guard = guard;
+                            }
+                            Err(e) => {
+                                metrics.on_config_reload_failure("access_control_reload");
+                                tracing::warn!("Access control config parse/build failed: {e}");
+                            }
+                        },
+                        Ok(None) => {}
+                        Err(e) => {
+                            metrics.on_config_reload_failure("access_control_reload");
+                            tracing::warn!("Access control config reload failed: {e}");
                         }
                     }
                 }
@@ -3056,6 +3099,9 @@ async fn build_live_config(
         router_chain,
         guard_chain: None,
         group_guard_chains: HashMap::new(),
+        // Placeholder — `reload_live_config` immediately carries forward the previous
+        // value, same as `guard_chain`/`group_guard_chains` above.
+        access_control_guard: None,
         cluster_manager,
         adapters: cache.adapters.clone(),
         health_check_targets,
@@ -3091,6 +3137,7 @@ struct PreservedLive {
     authorization: Arc<dyn queryflux_auth::AuthorizationChecker>,
     guard_chain: Option<Arc<GuardChain>>,
     group_guard_chains: HashMap<String, Arc<GuardChain>>,
+    access_control_guard: Option<Arc<OpaAccessGuard>>,
     catalog: Arc<dyn queryflux_core::catalog::CatalogProvider>,
 }
 
@@ -3160,6 +3207,7 @@ async fn reload_live_config(
             tracing::warn!(error = %e, "reload: load_group_translation_bodies failed");
             HashMap::new()
         });
+    let group_translation_scripts = validate_group_translation_scripts(group_translation_scripts);
     let guard_script_bodies = load_guard_script_bodies(Some(pg.as_ref() as &dyn AdminStore)).await;
 
     let mut live = build_live_config(
@@ -3181,6 +3229,9 @@ async fn reload_live_config(
     live.authorization = prev.authorization.clone();
     live.guard_chain = prev.guard_chain.clone();
     live.group_guard_chains = prev.group_guard_chains.clone();
+    // Startup already applied any stored `access_control_config` over the YAML; reload
+    // re-reads it below and overrides on success (same contract as catalog / guardrails).
+    live.access_control_guard = prev.access_control_guard.clone();
     live.catalog = prev.catalog.clone();
 
     // Guardrails from DB (UI-managed) override carried-over chains. An admin
@@ -3280,6 +3331,25 @@ async fn reload_live_config(
         }
     }
 
+    match pg.get_proxy_setting("access_control_config").await {
+        Ok(Some(v)) => match apply_stored_access_control(&v) {
+            Ok(guard) => live.access_control_guard = guard,
+            Err(e) => {
+                metrics.on_config_reload_failure("access_control_reload");
+                tracing::warn!(
+                    "Reload: access_control_config parse/build failed; keeping previous: {e}"
+                )
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            metrics.on_config_reload_failure("access_control_reload");
+            tracing::warn!(
+                "Reload: access_control_config read failed; keeping previous access control: {e}"
+            )
+        }
+    }
+
     Ok(live)
 }
 
@@ -3370,6 +3440,41 @@ fn build_authorization(
             Arc::new(OpenFgaAuthorizationClient::new(openfga_cfg).with_operators(operators))
         }
     })
+}
+
+/// Drops any persisted translation fixup script that fails
+/// [`queryflux_translation::sqlglot::validate_fixup_script`] — most commonly one written
+/// against the pre-this-PR `transform(ast, src, dst) -> None` contract rather than the
+/// current `transform(sql: str, src: str, dst: str) -> str`. Scripts are user/admin-editable
+/// (Studio), so a stale one must not block the whole proxy from starting or reloading;
+/// dropping just that script (with a loud warning naming the group and index) means the
+/// group's other fixups and translation still work, instead of every query for that group
+/// failing at translation time on first use.
+fn validate_group_translation_scripts(
+    scripts: HashMap<String, Vec<String>>,
+) -> HashMap<String, Vec<String>> {
+    scripts
+        .into_iter()
+        .map(|(group, group_scripts)| {
+            let valid = group_scripts
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, script)| {
+                    match queryflux_translation::sqlglot::validate_fixup_script(&script) {
+                        Ok(()) => Some(script),
+                        Err(e) => {
+                            tracing::error!(
+                                group = %group, index = i,
+                                "translation fixup script failed validation and will not run: {e}"
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect();
+            (group, valid)
+        })
+        .collect()
 }
 
 async fn load_guard_script_bodies(store: Option<&dyn AdminStore>) -> HashMap<i64, String> {
@@ -3484,6 +3589,55 @@ fn make_http_webhook_guard(
                 reason: format!("http_webhook url is not a valid URL: {e}"),
             })
         }
+    }
+}
+
+/// Build the data access-control guard at startup.
+///
+/// A persisted `access_control_config` (Studio / admin API) is authoritative when present —
+/// the same contract reload and guardrails follow — so a restart doesn't leave the stored
+/// policy inactive behind a missing or weaker YAML section. Without one, the `access_control:`
+/// YAML section is used, and `None` when that is absent too.
+///
+/// Anything that stops a stored policy from being read or built aborts startup: serving
+/// queries with a weaker policy than the operator saved would be a silent bypass. The YAML
+/// was already validated by `ProxyConfig::validate_startup_security`, so a residual build
+/// failure there aborts too rather than quietly disabling enforcement.
+async fn build_access_control_guard(
+    config: &queryflux_core::config::ProxyConfig,
+    backend: Option<&dyn BackendStore>,
+) -> Result<Option<Arc<OpaAccessGuard>>> {
+    if let Some(store) = backend {
+        match store.get_proxy_setting("access_control_config").await {
+            Ok(Some(v)) => {
+                return apply_stored_access_control(&v).map_err(|e| {
+                    anyhow::anyhow!(
+                        "stored access_control_config could not be applied; refusing to start \
+                         with a weaker policy: {e}"
+                    )
+                });
+            }
+            Ok(None) => {}
+            Err(e) => anyhow::bail!(
+                "could not read stored access_control_config; refusing to start with a \
+                 possibly weaker policy: {e}"
+            ),
+        }
+    }
+    let Some(cfg) = config.access_control.as_ref() else {
+        return Ok(None);
+    };
+    OpaAccessGuard::try_from_config(cfg)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("access_control config failed to build: {e}"))
+}
+
+fn apply_stored_access_control(
+    v: &serde_json::Value,
+) -> std::result::Result<Option<Arc<OpaAccessGuard>>, String> {
+    match queryflux_core::access_config::AccessControlConfig::from_admin_value(v)? {
+        None => Ok(None),
+        Some(cfg) => Ok(Some(OpaAccessGuard::try_from_config(&cfg)?)),
     }
 }
 
@@ -3753,6 +3907,29 @@ fn in_memory_metrics(
 
 #[cfg(test)]
 mod tests {
+    mod group_translation_scripts {
+        use std::collections::HashMap;
+
+        use super::super::validate_group_translation_scripts;
+
+        #[test]
+        fn drops_only_the_group_whose_script_fails_validation() {
+            let scripts = HashMap::from([
+                (
+                    "good-group".to_string(),
+                    vec!["def transform(sql, src, dst):\n    return sql\n".to_string()],
+                ),
+                (
+                    "legacy-group".to_string(),
+                    vec!["def transform(ast, src, dst):\n    return None\n".to_string()],
+                ),
+            ]);
+            let valid = validate_group_translation_scripts(scripts);
+            assert_eq!(valid.get("good-group").map(Vec::len), Some(1));
+            assert_eq!(valid.get("legacy-group").map(Vec::len), Some(0));
+        }
+    }
+
     mod frontend_tasks {
         use std::time::Duration;
 
@@ -3889,14 +4066,25 @@ mod tests {
     }
 
     mod guard_chains {
-        use std::collections::HashMap;
+        use std::collections::{BTreeMap, HashMap};
 
         use queryflux_core::config::{GuardKindConfig, GuardSpecConfig, GuardrailsConfig};
-        use queryflux_core::query::{ClusterGroupName, EngineType};
+        use queryflux_core::query::{ClusterGroupName, EngineType, SqlDialect};
         use queryflux_core::tags::QueryTags;
-        use queryflux_guardrails::context::{GuardContext, GuardLayer};
+        use queryflux_guardrails::context::{GuardChainOutcome, GuardContext, GuardLayer};
 
         use super::super::{build_chain_from_db_specs, build_chain_from_yaml_specs};
+
+        fn is_blocked(o: &GuardChainOutcome) -> bool {
+            matches!(o, GuardChainOutcome::Blocked { .. })
+        }
+
+        static EMPTY_S: Vec<String> = Vec::new();
+        static GENERIC_DIALECT: SqlDialect = SqlDialect::Generic;
+        static EMPTY_ATTRS: std::sync::LazyLock<BTreeMap<String, serde_json::Value>> =
+            std::sync::LazyLock::new(BTreeMap::new);
+        static EMPTY_EXTRA: std::sync::LazyLock<HashMap<String, String>> =
+            std::sync::LazyLock::new(HashMap::new);
 
         fn plan_ctx<'a>(
             engine: &'a EngineType,
@@ -3905,12 +4093,18 @@ mod tests {
         ) -> GuardContext<'a> {
             GuardContext {
                 sql: "SELECT 1",
-                translated_sql: "SELECT 1",
+                original_sql: None,
+                dialect: &GENERIC_DIALECT,
                 engine_type: engine,
                 cluster_group: group,
                 user: Some("alice"),
+                groups: &EMPTY_S,
+                roles: &EMPTY_S,
+                attributes: &EMPTY_ATTRS,
                 agent_context: None,
                 query_tags: tags,
+                session_extra: &EMPTY_EXTRA,
+                schema: None,
                 sql_parse: None,
             }
         }
@@ -3936,8 +4130,8 @@ mod tests {
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(blocked);
+            let (actions, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(is_blocked(&outcome));
             assert_eq!(actions.len(), 1);
             assert_eq!(actions[0].guard, "built_in");
             assert_eq!(actions[0].action, "deny");
@@ -3973,8 +4167,8 @@ mod tests {
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(blocked);
+            let (_, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(is_blocked(&outcome));
         }
 
         #[tokio::test]
@@ -3986,8 +4180,8 @@ mod tests {
             let chain =
                 build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(blocked);
+            let (actions, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(is_blocked(&outcome));
             assert_eq!(actions[0].guard, "guard");
             assert!(actions[0]
                 .reason
@@ -4017,8 +4211,8 @@ mod tests {
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(!blocked);
+            let (_, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(!is_blocked(&outcome));
         }
 
         #[tokio::test]
@@ -4044,8 +4238,11 @@ mod tests {
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(blocked, "non-http(s) webhook URL must deny at construction");
+            let (actions, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(
+                is_blocked(&outcome),
+                "non-http(s) webhook URL must deny at construction"
+            );
             assert_eq!(actions[0].guard, "http_webhook");
             assert!(actions[0]
                 .reason
@@ -4077,9 +4274,9 @@ mod tests {
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            let (_, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
             assert!(
-                !blocked,
+                !is_blocked(&outcome),
                 "valid http(s) webhook with fail_open must allow when unreachable"
             );
         }
@@ -4097,8 +4294,8 @@ mod tests {
             let chain =
                 build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(blocked);
+            let (actions, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(is_blocked(&outcome));
             assert_eq!(actions[0].guard, "http_webhook");
             assert!(actions[0]
                 .reason
@@ -4131,6 +4328,8 @@ mod tests {
                 frontend_protocol: FrontendProtocol::TrinoHttp,
                 source_dialect: SqlDialect::Trino,
                 target_dialect: SqlDialect::DuckDb,
+                was_rewritten: false,
+                rewritten_sql: None,
                 was_translated: false,
                 translated_sql: None,
                 user: None,

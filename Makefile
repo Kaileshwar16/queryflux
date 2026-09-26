@@ -28,17 +28,19 @@ endif
 
 .PHONY: dev stop logs build lint clippy check helm-check test benchmark benchmark-build benchmark-run test-e2e clean setup
 
+
+
 ## Create virtualenv and install Python dependencies (sqlglot etc.)
 setup:
 	python3 -m venv .venv
 	.venv/bin/pip install -r requirements.txt
 	@echo "Python env ready. Run: export PYO3_PYTHON=$$(pwd)/.venv/bin/python3"
 
-## Start all services (Trino, StarRocks, Lakekeeper + MinIO, Postgres, observability),
+## Start all services (Trino, StarRocks, Lakekeeper + RustFS, Postgres, observability),
 ## load TPC-H data into Iceberg, then run QueryFlux locally.
 env:
-	@test -f .venv/bin/python3 || (echo "Run 'make setup' first" && exit 1)
-	@pkill -f "queryflux.*config.local.yaml" 2>/dev/null; true
+	test -f .venv/bin/python3 || (echo "Run 'make setup' first" && exit 1)
+	@pkill -f '[q]ueryflux.*config\.local\.yaml' 2>/dev/null || true
 	$(COMPOSE) up -d --wait trino starrocks postgres sentinel
 	$(COMPOSE) run --rm -T data-loader
 	$(COMPOSE) run --rm -T starrocks-catalog-setup
@@ -50,12 +52,16 @@ server:
 	PYTHONPATH=$(PYTHONPATH_VENV) \
 	RUST_LOG=queryflux=info,queryflux_frontend=info \
 	$(CARGO) run --bin queryflux -- --config config.local.yaml
+
+dev:
+	$(MAKE) env
+	$(MAKE) server
 ## Stop Docker services and any running QueryFlux process
 stop:
-	@pkill -f "queryflux.*config.local.yaml" 2>/dev/null; true
+	@pkill -f '[q]ueryflux.*config\.local\.yaml' 2>/dev/null || true
 	$(COMPOSE) down
 
-## Stream logs from Docker services
+## Stream logs from Docker services	
 logs:
 	$(COMPOSE) logs -f
 
@@ -119,7 +125,7 @@ test-e2e:
 	STARROCKS_URL=mysql://root@localhost:9030 \
 	CLICKHOUSE_URL=http://localhost:18123 \
 	LAKEKEEPER_URL=http://localhost:18181 \
-	MINIO_ENDPOINT=localhost:19000 \
+	RUSTFS_ENDPOINT=localhost:19000 \
 	$(CARGO) test -p queryflux-e2e-tests --manifest-path Cargo.toml -- --test-threads=1 --include-ignored --nocapture
 
 ## Remove build artifacts and Docker volumes

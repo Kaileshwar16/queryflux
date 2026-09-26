@@ -1,16 +1,8 @@
 use async_trait::async_trait;
-use polyglot_sql::{
-    expressions::{Expression, Literal},
-    DialectType,
-};
-use queryflux_core::query::EngineType;
+use polyglot_sql::expressions::{Expression, Literal};
 use queryflux_core::sql_classify::{is_read_like_fallback, is_read_stmt, to_polyglot_dialect};
 
 use crate::context::{GuardContext, GuardLayer, GuardResult};
-
-fn engine_dialect(engine: &EngineType) -> DialectType {
-    to_polyglot_dialect(&engine.dialect())
-}
 
 /// Async so parsing (and any wait for a `polyglot_pool` worker) never blocks the
 /// calling task's Tokio worker thread — `check` is on the live request path for
@@ -23,8 +15,8 @@ async fn guard_statements<'a>(
         return cache.statements().map(std::borrow::Cow::Borrowed).ok_or(());
     }
 
-    let sql = ctx.translated_sql.to_string();
-    let dialect = engine_dialect(ctx.engine_type);
+    let sql = ctx.sql.to_string();
+    let dialect = to_polyglot_dialect(ctx.dialect);
     tokio::task::spawn_blocking(move || {
         queryflux_core::polyglot_pool::run(move || polyglot_sql::parse(&sql, dialect))
     })
@@ -72,7 +64,7 @@ impl Guard for ReadOnlyGuard {
                 GuardResult::allow()
             }
             Err(_) => {
-                if is_read_like_fallback(ctx.translated_sql) {
+                if is_read_like_fallback(ctx.sql) {
                     GuardResult::allow()
                 } else {
                     GuardResult::deny("write operations are not permitted", "READ_ONLY_VIOLATION")
@@ -127,7 +119,7 @@ impl Guard for RowLimitGuard {
             }
             Err(_) => {
                 // Fall back to string heuristic.
-                let upper = ctx.translated_sql.to_uppercase();
+                let upper = ctx.sql.to_uppercase();
                 if !upper.contains(" LIMIT ") {
                     return GuardResult::warn("query has no LIMIT clause; result set may be large");
                 }
@@ -208,7 +200,7 @@ impl Guard for RequirePredicateGuard {
             }
             Err(_) => {
                 // Fall back to string heuristic.
-                let upper = ctx.translated_sql.to_uppercase();
+                let upper = ctx.sql.to_uppercase();
                 if !upper.trim_start().starts_with("SELECT") {
                     return GuardResult::allow();
                 }
@@ -314,30 +306,40 @@ fn simple_glob_match(haystack: &str, pattern: &str) -> bool {
 mod tests {
     use super::*;
     use queryflux_core::{
-        query::{ClusterGroupName, EngineType},
+        query::{ClusterGroupName, EngineType, SqlDialect},
         tags::QueryTags,
     };
+    use std::collections::{BTreeMap, HashMap};
 
     struct TestCtx {
         sql: String,
-        translated_sql: String,
+        dialect: SqlDialect,
         engine_type: EngineType,
         cluster_group: ClusterGroupName,
         query_tags: QueryTags,
+        groups: Vec<String>,
+        roles: Vec<String>,
+        attributes: BTreeMap<String, serde_json::Value>,
+        session_extra: HashMap<String, String>,
     }
 
     impl TestCtx {
-        fn new(sql: &str, translated: &str) -> Self {
+        fn new(sql: &str) -> Self {
             Self {
                 sql: sql.to_string(),
-                translated_sql: translated.to_string(),
+                dialect: EngineType::DuckDb.dialect(),
                 engine_type: EngineType::DuckDb,
                 cluster_group: ClusterGroupName("default".to_string()),
                 query_tags: QueryTags::new(),
+                groups: Vec::new(),
+                roles: Vec::new(),
+                attributes: BTreeMap::new(),
+                session_extra: HashMap::new(),
             }
         }
 
         fn with_engine(mut self, engine: EngineType) -> Self {
+            self.dialect = engine.dialect();
             self.engine_type = engine;
             self
         }
@@ -345,12 +347,18 @@ mod tests {
         fn ctx(&self) -> GuardContext<'_> {
             GuardContext {
                 sql: &self.sql,
-                translated_sql: &self.translated_sql,
+                original_sql: None,
+                dialect: &self.dialect,
                 engine_type: &self.engine_type,
                 cluster_group: &self.cluster_group,
                 user: None,
+                groups: &self.groups,
+                roles: &self.roles,
+                attributes: &self.attributes,
                 agent_context: None,
                 query_tags: &self.query_tags,
+                session_extra: &self.session_extra,
+                schema: None,
                 sql_parse: None,
             }
         }
@@ -358,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_allows_select() {
-        let tc = TestCtx::new("SELECT 1", "SELECT 1");
+        let tc = TestCtx::new("SELECT 1");
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny());
     }
@@ -366,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_allows_cte() {
         let sql = "WITH cte AS (SELECT 1 AS n) SELECT n FROM cte";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny());
     }
@@ -374,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_blocks_insert() {
         let sql = "INSERT INTO t VALUES (1)";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(r.is_deny());
     }
@@ -382,7 +390,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_blocks_delete() {
         let sql = "DELETE FROM t WHERE id = 1";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(r.is_deny());
     }
@@ -390,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_blocks_update() {
         let sql = "UPDATE t SET x = 1 WHERE id = 2";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(r.is_deny());
     }
@@ -398,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_allows_show() {
         let sql = "SHOW TABLES";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny());
     }
@@ -406,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_allows_explain() {
         let sql = "EXPLAIN SELECT 1";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny());
     }
@@ -414,7 +422,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_allows_describe() {
         let sql = "DESCRIBE orders";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny());
     }
@@ -422,7 +430,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_allows_union_all() {
         let sql = "SELECT 1 AS n UNION ALL SELECT 2 AS n";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny());
     }
@@ -430,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_blocks_truncate() {
         let sql = "TRUNCATE TABLE t";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(r.is_deny());
     }
@@ -438,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_blocks_second_statement_insert() {
         let sql = "SELECT 1; INSERT INTO t VALUES (42)";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(r.is_deny());
     }
@@ -446,7 +454,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_allows_multiple_read_statements_semicolon() {
         let sql = "SELECT 1 AS n; SELECT 2 AS n; WITH c AS (SELECT 3 AS n) SELECT n FROM c";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny());
     }
@@ -454,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn read_only_blocks_when_batch_mixes_update_and_select() {
         let sql = "UPDATE t SET x = 1 WHERE id = 0; SELECT 1";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(r.is_deny());
     }
@@ -479,7 +487,7 @@ SELECT r.region, r.total
 FROM regional_sales AS r
 INNER JOIN top_regions AS t ON t.region = r.region
 "#;
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny());
     }
@@ -492,14 +500,14 @@ SELECT n FROM base
 UNION ALL
 SELECT 3 AS n
 "#;
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny());
     }
 
     #[tokio::test]
     async fn read_only_allows_leading_whitespace_select() {
-        let tc = TestCtx::new("", "\n\t  SELECT 1");
+        let tc = TestCtx::new("\n\t  SELECT 1");
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny());
     }
@@ -508,7 +516,7 @@ SELECT 3 AS n
     #[tokio::test]
     async fn read_only_heuristic_allows_odd_select_when_parse_fails() {
         let sql = "SELECT {invalid but starts with SELECT";
-        let tc = TestCtx::new(sql, sql).with_engine(EngineType::Adbc);
+        let tc = TestCtx::new(sql).with_engine(EngineType::Adbc);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(!r.is_deny());
     }
@@ -517,14 +525,14 @@ SELECT 3 AS n
     async fn read_only_blocks_merge_snowflake() {
         let sql =
             "MERGE INTO tgt USING src ON tgt.id = src.id WHEN MATCHED THEN UPDATE SET x = src.x";
-        let tc = TestCtx::new(sql, sql).with_engine(EngineType::Snowflake);
+        let tc = TestCtx::new(sql).with_engine(EngineType::Snowflake);
         let r = ReadOnlyGuard.check(&tc.ctx()).await;
         assert!(r.is_deny());
     }
 
     #[tokio::test]
     async fn row_limit_warns_on_missing_limit() {
-        let tc = TestCtx::new("SELECT * FROM t", "SELECT * FROM t");
+        let tc = TestCtx::new("SELECT * FROM t");
         let g = RowLimitGuard {
             max_rows: Some(1000),
         };
@@ -535,7 +543,7 @@ SELECT 3 AS n
     #[tokio::test]
     async fn row_limit_allows_within_max() {
         let sql = "SELECT * FROM t LIMIT 100";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
         };
@@ -546,7 +554,7 @@ SELECT 3 AS n
     #[tokio::test]
     async fn row_limit_denies_over_max() {
         let sql = "SELECT * FROM t LIMIT 5000";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
         };
@@ -558,7 +566,7 @@ SELECT 3 AS n
     async fn row_limit_not_fooled_by_subquery_limit() {
         // Outer LIMIT 10 is within max; inner LIMIT 9999 should not trigger denial.
         let sql = "SELECT * FROM (SELECT * FROM t LIMIT 9999) sub LIMIT 10";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
         };
@@ -568,7 +576,7 @@ SELECT 3 AS n
 
     #[tokio::test]
     async fn row_limit_warns_when_max_rows_disabled_and_no_limit() {
-        let tc = TestCtx::new("SELECT * FROM t", "SELECT * FROM t");
+        let tc = TestCtx::new("SELECT * FROM t");
         let g = RowLimitGuard { max_rows: None };
         let r = g.check(&tc.ctx()).await;
         assert!(matches!(r, GuardResult::Warn { .. }));
@@ -577,7 +585,7 @@ SELECT 3 AS n
     #[tokio::test]
     async fn row_limit_allows_exactly_at_max() {
         let sql = "SELECT * FROM t LIMIT 1000";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
         };
@@ -588,7 +596,7 @@ SELECT 3 AS n
     #[tokio::test]
     async fn row_limit_union_all_with_trailing_limit() {
         let sql = "SELECT * FROM a UNION ALL SELECT * FROM b LIMIT 100";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(500),
         };
@@ -600,7 +608,7 @@ SELECT 3 AS n
     async fn row_limit_skips_check_on_write_statement() {
         // INSERT has no meaningful LIMIT rule; guard ignores non-read statements.
         let sql = "INSERT INTO t SELECT * FROM u";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(100),
         };
@@ -612,7 +620,7 @@ SELECT 3 AS n
     #[tokio::test]
     async fn row_limit_first_select_wins_in_batch() {
         let sql = "SELECT * FROM a; SELECT * FROM b LIMIT 10";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
         };
@@ -623,7 +631,7 @@ SELECT 3 AS n
     #[tokio::test]
     async fn row_limit_multi_statement_each_select_has_limit() {
         let sql = "SELECT * FROM a LIMIT 5; SELECT * FROM b LIMIT 5";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(100),
         };
@@ -635,7 +643,7 @@ SELECT 3 AS n
     #[tokio::test]
     async fn row_limit_multi_statement_second_select_lacks_limit_warns() {
         let sql = "SELECT * FROM t LIMIT 10; SELECT * FROM u";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(1000),
         };
@@ -655,7 +663,7 @@ FROM a
 INNER JOIN b ON a.id = b.id
 LIMIT 50
 "#;
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(100),
         };
@@ -671,7 +679,7 @@ WITH
   y AS (SELECT * FROM bar LIMIT 9999)
 SELECT * FROM x CROSS JOIN y
 "#;
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RowLimitGuard {
             max_rows: Some(10000),
         };
@@ -682,7 +690,7 @@ SELECT * FROM x CROSS JOIN y
     #[tokio::test]
     async fn row_limit_string_fallback_finds_limit() {
         let sql = "SELECT * FROM t LIMIT 77";
-        let tc = TestCtx::new(sql, sql).with_engine(EngineType::Adbc);
+        let tc = TestCtx::new(sql).with_engine(EngineType::Adbc);
         let g = RowLimitGuard {
             max_rows: Some(100),
         };
@@ -693,7 +701,7 @@ SELECT * FROM x CROSS JOIN y
     #[tokio::test]
     async fn row_limit_string_fallback_denies_over_cap() {
         let sql = "SELECT * FROM t LIMIT 500";
-        let tc = TestCtx::new(sql, sql).with_engine(EngineType::Adbc);
+        let tc = TestCtx::new(sql).with_engine(EngineType::Adbc);
         let g = RowLimitGuard {
             max_rows: Some(100),
         };
@@ -703,7 +711,7 @@ SELECT * FROM x CROSS JOIN y
 
     #[tokio::test]
     async fn require_predicate_blocks_full_scan() {
-        let tc = TestCtx::new("SELECT * FROM orders", "SELECT * FROM orders");
+        let tc = TestCtx::new("SELECT * FROM orders");
         let g = RequirePredicateGuard { applies_to: vec![] };
         let r = g.check(&tc.ctx()).await;
         assert!(r.is_deny());
@@ -712,7 +720,7 @@ SELECT * FROM x CROSS JOIN y
     #[tokio::test]
     async fn require_predicate_allows_with_where() {
         let sql = "SELECT * FROM orders WHERE id = 1";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RequirePredicateGuard { applies_to: vec![] };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
@@ -721,7 +729,7 @@ SELECT * FROM x CROSS JOIN y
     #[tokio::test]
     async fn require_predicate_skips_non_matching_table() {
         // "users" does not match the fct_* pattern, so no WHERE is required.
-        let tc = TestCtx::new("SELECT * FROM users", "SELECT * FROM users");
+        let tc = TestCtx::new("SELECT * FROM users");
         let g = RequirePredicateGuard {
             applies_to: vec!["fct_*".to_string()],
         };
@@ -732,7 +740,7 @@ SELECT * FROM x CROSS JOIN y
     #[tokio::test]
     async fn require_predicate_matches_glob() {
         // "fct_events" matches fct_* and has no WHERE → must be denied.
-        let tc = TestCtx::new("SELECT * FROM fct_events", "SELECT * FROM fct_events");
+        let tc = TestCtx::new("SELECT * FROM fct_events");
         let g = RequirePredicateGuard {
             applies_to: vec!["fct_*".to_string()],
         };
@@ -743,7 +751,7 @@ SELECT * FROM x CROSS JOIN y
     #[tokio::test]
     async fn require_predicate_union_denies_if_one_arm_lacks_where() {
         let sql = "SELECT * FROM fct_a WHERE id = 1 UNION ALL SELECT * FROM fct_b";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RequirePredicateGuard {
             applies_to: vec!["fct_*".to_string()],
         };
@@ -754,7 +762,7 @@ SELECT * FROM x CROSS JOIN y
     #[tokio::test]
     async fn require_predicate_union_allows_both_predicate() {
         let sql = "SELECT * FROM fct_a WHERE TRUE UNION ALL SELECT * FROM fct_b WHERE TRUE";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RequirePredicateGuard {
             applies_to: vec!["fct_*".to_string()],
         };
@@ -765,7 +773,7 @@ SELECT * FROM x CROSS JOIN y
     #[tokio::test]
     async fn require_predicate_schema_qualified_matches_dw_prefix_glob() {
         let sql = "SELECT * FROM dw.fct_events";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RequirePredicateGuard {
             applies_to: vec!["dw.fct_*".to_string()],
         };
@@ -776,7 +784,7 @@ SELECT * FROM x CROSS JOIN y
     #[tokio::test]
     async fn require_predicate_schema_qualified_allows_with_where() {
         let sql = "SELECT * FROM dw.fct_events WHERE ds = '2024-01-01'";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RequirePredicateGuard {
             applies_to: vec!["dw.fct_*".to_string()],
         };
@@ -787,7 +795,7 @@ SELECT * FROM x CROSS JOIN y
     #[tokio::test]
     async fn require_predicate_allows_insert_even_without_where() {
         let sql = "INSERT INTO fct_events SELECT * FROM staging";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RequirePredicateGuard {
             applies_to: vec!["fct_*".to_string()],
         };
@@ -798,7 +806,7 @@ SELECT * FROM x CROSS JOIN y
     #[tokio::test]
     async fn require_predicate_heuristic_non_select_allows() {
         let sql = "DELETE FROM fct_events WHERE id = 1";
-        let tc = TestCtx::new(sql, sql).with_engine(EngineType::Adbc);
+        let tc = TestCtx::new(sql).with_engine(EngineType::Adbc);
         let g = RequirePredicateGuard { applies_to: vec![] };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
@@ -811,7 +819,7 @@ SELECT * FROM x CROSS JOIN y
 WITH prep AS (SELECT * FROM orders WHERE status = 'open')
 SELECT * FROM prep
 "#;
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RequirePredicateGuard { applies_to: vec![] };
         let r = g.check(&tc.ctx()).await;
         assert!(r.is_deny());
@@ -823,7 +831,7 @@ SELECT * FROM prep
 WITH prep AS (SELECT * FROM orders WHERE status = 'open')
 SELECT * FROM prep WHERE id = 1
 "#;
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RequirePredicateGuard { applies_to: vec![] };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());
@@ -836,7 +844,7 @@ SELECT * FROM prep WHERE id = 1
 WITH filtered AS (SELECT * FROM fct_orders WHERE ds = '2024-01-01')
 SELECT order_id, amount FROM filtered
 "#;
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RequirePredicateGuard {
             applies_to: vec!["fct_*".to_string()],
         };
@@ -847,7 +855,7 @@ SELECT order_id, amount FROM filtered
     #[tokio::test]
     async fn require_predicate_multi_statement_second_select_lacks_where() {
         let sql = "SELECT * FROM orders WHERE id = 1; SELECT * FROM orders";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RequirePredicateGuard { applies_to: vec![] };
         let r = g.check(&tc.ctx()).await;
         assert!(r.is_deny());
@@ -856,7 +864,7 @@ SELECT order_id, amount FROM filtered
     #[tokio::test]
     async fn require_predicate_multi_statement_both_with_where_allow() {
         let sql = "SELECT * FROM a WHERE x = 1; SELECT * FROM b WHERE y = 2";
-        let tc = TestCtx::new(sql, sql);
+        let tc = TestCtx::new(sql);
         let g = RequirePredicateGuard { applies_to: vec![] };
         let r = g.check(&tc.ctx()).await;
         assert!(!r.is_deny());

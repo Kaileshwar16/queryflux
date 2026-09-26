@@ -32,6 +32,8 @@ fn maybe_trino_adbc_adapter() -> Option<AdbcAdapter> {
         db_kwargs: Vec::new(),
         flight_sql_cluster_dialect: None,
         pool_size: 2,
+        scoped_pool_idle_timeout_secs: 900,
+        scoped_pool_max_count: 500,
     };
     match AdbcAdapter::new(
         ClusterName("trino-adbc-e2e".to_string()),

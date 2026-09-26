@@ -75,6 +75,17 @@ The credentials are authenticated against the configured `auth_provider`. A sess
 
 Stateless: credentials are provided on every request as `Authorization: Bearer <token>`. The token is validated against the configured `auth_provider`.
 
+### ADBC backend pool lifecycle
+
+When the backend is Snowflake over ADBC, caller credentials and session role,
+warehouse, or schema overrides use isolated sub-pools. Set `scopedPoolIdleTimeoutSecs`
+(default `900`) and `scopedPoolMaxCount` (default `500`) in the **ADBC cluster config**
+to control idle expiry and the LRU cache bound. These are separate from frontend
+session timeouts. Background eviction releases unused backend connections even
+without new queries and lets in-flight queries finish. See
+[ADBC scoped connection pools](../../authentication.md#adbc-scoped-connection-pools)
+for metrics and lifecycle details.
+
 ## Execution model
 
 Both sub-protocols execute queries **synchronously** via `execute_to_sink`. All results are accumulated into memory and returned in a single response.

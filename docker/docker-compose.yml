@@ -52,7 +52,7 @@ services:
       retries: 10
 
   # ---------------------------------------------------------------------------
-  # Iceberg catalog stack (Lakekeeper + MinIO)
+  # Iceberg catalog stack (Lakekeeper + RustFS)
   # ---------------------------------------------------------------------------
 
   lakekeeper-db:
@@ -66,33 +66,32 @@ services:
       retries: 10
       start_period: 10s
 
-  minio:
-    image: quay.io/minio/minio
+  rustfs:
+    image: rustfs/rustfs:1.0.0
     environment:
-      - MINIO_ROOT_USER=minio-root-user
-      - MINIO_ROOT_PASSWORD=minio-root-password
-    command: ["server", "--console-address", ":9001", "/data"]
+      - RUSTFS_ACCESS_KEY=rustfs-root-user
+      - RUSTFS_SECRET_KEY=rustfs-root-password
     ports:
       - "19000:9000"
-      - "19001:9001"  # MinIO console
+      - "19001:9001"  # RustFS console
+    volumes:
+      - rustfs-data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health/ready"]
       interval: 2s
       timeout: 10s
       retries: 20
       start_period: 15s
 
   createbuckets:
-    image: quay.io/minio/minio
+    image: curlimages/curl
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
     restart: on-failure
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set local http://minio:9000 minio-root-user minio-root-password;
-      /usr/bin/mc mb --ignore-existing local/warehouse;
-      exit 0;
+      curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 -u rustfs-root-user:rustfs-root-password -X PUT http://rustfs:9000/warehouse
       "
 
   migrate:
@@ -129,7 +128,7 @@ services:
         condition: service_completed_successfully
       lakekeeper-db:
         condition: service_healthy
-      minio:
+      rustfs:
         condition: service_healthy
       createbuckets:
         condition: service_completed_successfully
@@ -198,7 +197,7 @@ services:
         sed "s/FROM tpch\\.tiny\\./FROM tpch.$${TPCH_SCALE}./g" /test-data/init.sql > /tmp/init.run.sql
         exec trino --server http://trino:8080 --user loader --file /tmp/init.run.sql
     volumes:
-      - ./docker/fixtures/init.sql:/test-data/init.sql:ro
+      - ./docker/fixtures/init.docker-network.sql:/test-data/init.sql:ro
 
   # Register the Lakekeeper Iceberg external catalog in StarRocks.
   # Run separately: `docker compose run --rm -T starrocks-catalog-setup`
@@ -250,3 +249,4 @@ volumes:
   queryflux-pg:
   prometheus-data:
   grafana-data:
+  rustfs-data:
