@@ -26,10 +26,18 @@ on:
       - '.github/PULL_REQUEST_TEMPLATE/**'
       - 'LICENSE*'
 
-# One active run per PR or branch: a new push cancels any in-progress run for the same target.
+# One active run per PR: a new push cancels the previous in-progress run for the same PR.
+# All main pushes share one group too (github.ref is constant across them), so they still
+# run one at a time — but never cancelled: a squash-merge's run should always run to
+# completion rather than losing CI coverage for a commit because another merge landed right
+# behind it. `queue: max` (vs. the default `single`) matters here too: with the default, a
+# second push arriving while one push run is already queued would bump that queued run out
+# in favor of the newest one, silently dropping CI for that commit even though nothing was
+# "cancelled" in the visible sense — `max` keeps every pending main run queued instead.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  queue: ${{ github.event_name == 'pull_request' && 'single' || 'max' }}
 
 env:
   RUST_TOOLCHAIN_VERSION: "1.91.1"
@@ -78,10 +86,49 @@ jobs:
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
       - run: make helm-check
 
+  # The `rust` job below is expensive (up to 120min: compile, clippy, unit, Postgres, and a
+  # Docker-based e2e stack) — a PR needs a maintainer's approval before it runs, so it
+  # doesn't burn CI minutes on every push before anyone has looked at the PR. A push to
+  # main (already reviewed via the PR that merged it) does not need that approval.
+  #
+  # This is two tiny, mutually-exclusive gate jobs — one per trigger type, each `if:`-
+  # skipped for the other — rather than a conditional `environment:` expression on `rust`
+  # itself: GitHub Actions doesn't clearly document what an empty/null environment-name
+  # expression does, so `environment:` here is only ever a fixed, always-present string.
+  # `rust`'s own `if:` (below) then requires each of these to be either `success` or
+  # `skipped`, never `failure`.
+  approval-gate-pr:
+    name: CI approval (PR)
+    needs: gate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    environment: ci-approval
+    steps:
+      - run: echo "Approved — starting the Rust job."
+
+  approval-gate-push:
+    name: CI approval (push)
+    needs: gate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Push event — no approval gate."
+
   # One compile: clippy (--all-targets) then unit + Postgres + optional E2E reuse the same target dir.
   rust:
     name: Rust (clippy, unit & E2E)
-    needs: [gate, fmt]
+    needs: [gate, fmt, approval-gate-pr, approval-gate-push]
+    # Exactly one of the two gate jobs above actually runs (the other is skipped by its own
+    # `if:`) — proceed once whichever one ran has succeeded, and neither has failed.
+    # `!cancelled()`, not `always()`: this must still respect a cancelled run (e.g. a new
+    # push superseding this one via `concurrency: cancel-in-progress`) — `always()` would
+    # start this 120min job regardless.
+    if: |
+      !cancelled() &&
+      needs.gate.result == 'success' &&
+      needs.fmt.result == 'success' &&
+      (needs.approval-gate-pr.result == 'success' || needs.approval-gate-pr.result == 'skipped') &&
+      (needs.approval-gate-push.result == 'success' || needs.approval-gate-push.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 120
     # Faster CI dev builds: no debuginfo, mold linker (see corrode compile-times tips).
@@ -202,7 +249,19 @@ jobs:
       - name: Start e2e Docker stack (Trino + StarRocks + ClickHouse + sentinel)
         if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
         run: |
-          docker compose -f docker/docker-compose.test.yml --project-directory . up -d --wait --wait-timeout 300 trino starrocks clickhouse sentinel
+          # `docker compose up` occasionally fails on a transient registry error — e.g. quay.io
+          # returning 401 "unauthorized" for an anonymous pull once a shared runner IP hits its
+          # rate limit, not because the (public) image is actually gone. `up -d --wait` is safe
+          # to retry: already-healthy services are left alone, only what didn't come up gets
+          # retried.
+          for attempt in 1 2 3; do
+            if docker compose -f docker/docker-compose.test.yml --project-directory . up -d --wait --wait-timeout 300 trino starrocks clickhouse sentinel; then
+              exit 0
+            fi
+            echo "::warning::e2e stack failed to start (attempt ${attempt}/3)"
+            [ "$attempt" -lt 3 ] && sleep 30
+          done
+          exit 1
 
       - name: E2E tests (queryflux-e2e-tests)
         if: github.event_name == 'push' || steps.paths.outputs.e2e == 'true'
@@ -212,7 +271,7 @@ jobs:
           STARROCKS_URL: mysql://root@localhost:9030
           CLICKHOUSE_URL: http://localhost:18123
           LAKEKEEPER_URL: http://localhost:18181
-          MINIO_ENDPOINT: localhost:19000
+          RUSTFS_ENDPOINT: localhost:19000
         run: |
           cargo test -p queryflux-e2e-tests --manifest-path Cargo.toml -- --test-threads=1 --include-ignored
 

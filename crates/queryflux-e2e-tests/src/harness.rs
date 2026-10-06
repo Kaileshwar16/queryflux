@@ -6,7 +6,7 @@
 ///   CLICKHOUSE_URL    — default http://localhost:18123 (ClickHouse HTTP interface)
 ///
 /// Lakekeeper / Iceberg (optional):
-///   LAKEKEEPER_URL, MINIO_ENDPOINT — StarRocks external catalog DDL only.
+///   LAKEKEEPER_URL, RUSTFS_ENDPOINT — StarRocks external catalog DDL only.
 ///
 /// At least one of Trino or StarRocks must be reachable or [`TestHarness::new`] fails.
 use std::collections::HashMap;
@@ -204,9 +204,9 @@ impl TestHarness {
                        \"iceberg.catalog.warehouse\" = \"demo\", \
                        \"aws.s3.region\" = \"local\", \
                        \"aws.s3.enable_path_style_access\" = \"true\", \
-                       \"aws.s3.endpoint\" = \"http://minio:9000\", \
-                       \"aws.s3.access_key\" = \"minio-root-user\", \
-                       \"aws.s3.secret_key\" = \"minio-root-password\" \
+                       \"aws.s3.endpoint\" = \"http://rustfs:9000\", \
+                       \"aws.s3.access_key\" = \"rustfs-root-user\", \
+                       \"aws.s3.secret_key\" = \"rustfs-root-password\" \
                      )";
                 sr.execute_ddl(sr_setup).await.ok();
             }
@@ -523,6 +523,8 @@ async fn is_lakekeeper_ready(url: &str) -> bool {
 
 pub struct WireTestHarness {
     pub port: u16,
+    /// Allows tests to observe routing and backend dispatch through the real HTTP frontend.
+    pub live: Arc<tokio::sync::RwLock<LiveConfig>>,
     pub session_idle_timeout_secs: u64,
     pub session_max_age_secs: u64,
     _shutdown_tx: tokio::sync::oneshot::Sender<()>,
@@ -632,6 +634,7 @@ impl WireTestHarness {
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
         });
 
+        let live = state.live.clone();
         let snowflake_fe = SnowflakeFrontend::new(
             state,
             SnowflakeHttpFrontendConfig {
@@ -662,6 +665,7 @@ impl WireTestHarness {
             port,
             session_idle_timeout_secs,
             session_max_age_secs,
+            live,
             _shutdown_tx: shutdown_tx,
         })
     }
@@ -777,6 +781,7 @@ impl WireTestHarness {
             result_cache: Arc::new(queryflux_cache::noop::NoopResultCache),
         });
 
+        let live = state.live.clone();
         let snowflake_fe = SnowflakeFrontend::new(
             state,
             SnowflakeHttpFrontendConfig {
@@ -807,6 +812,7 @@ impl WireTestHarness {
             port,
             session_idle_timeout_secs,
             session_max_age_secs,
+            live,
             _shutdown_tx: shutdown_tx,
         }))
     }

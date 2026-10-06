@@ -2,8 +2,8 @@ pub mod access;
 pub mod sqlglot;
 
 pub use access::{
-    extract_resources, render_mask, rewrite_table_scans, ExtractedResource, ExtractedStatement,
-    MaskRenderError, TablePolicy,
+    apply_write_filters, extract_resources, render_mask, rewrite_table_scans, ExtractedResource,
+    ExtractedStatement, MaskRenderError, TablePolicy,
 };
 
 use std::collections::HashMap;
@@ -128,6 +128,11 @@ impl TranslationService {
         self.mode = mode;
         self.error_on_unsupported = error_on_unsupported;
         self
+    }
+
+    /// Global scripts can change SQL semantics after result-cache eligibility checks.
+    pub fn has_global_fixups(&self) -> bool {
+        !self.python_scripts.is_empty()
     }
 
     /// Overrides the default catalog-lookup timeout `resolve_schema_context` uses

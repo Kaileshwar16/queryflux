@@ -30,6 +30,49 @@ pub struct Identity {
 pub struct Operation(pub String);
 
 impl Operation {
+    /// Operations the guard classifies and can evaluate. Anything else in a connection's
+    /// `operations` list is a typo that would silently switch enforcement off, so config
+    /// validation rejects it.
+    pub const SUPPORTED: &'static [&'static str] = &[
+        "table.select",
+        "table.insert",
+        "table.update",
+        "table.delete",
+        "table.merge",
+        "table.truncate",
+        "table.create",
+        "table.drop",
+        "table.alter",
+        "view.create",
+        "view.drop",
+        "view.alter",
+        "schema.create",
+        "schema.drop",
+        "catalog.create",
+        "catalog.drop",
+        "session.set",
+        "session.use",
+        "role.create",
+        "role.drop",
+        "role.grant",
+        "role.revoke",
+        "role.set",
+        "grant.grant",
+        "grant.revoke",
+        "function.create",
+        "function.drop",
+        "procedure.create",
+        "procedure.drop",
+        "procedure.call",
+    ];
+
+    /// The operation a `CREATE OR REPLACE` also performs: replacing destroys the existing
+    /// object, so it needs the matching `*.drop` too. `None` for anything that isn't a create.
+    pub fn drop_counterpart(&self) -> Option<Self> {
+        let (kind, verb) = self.0.split_once('.')?;
+        (verb == "create").then(|| Self(format!("{kind}.drop")))
+    }
+
     pub fn table_select() -> Self {
         Self("table.select".to_string())
     }
@@ -50,21 +93,81 @@ pub enum Columns {
     Named(Vec<String>),
 }
 
-/// One table (with its referenced columns) a query touches.
+/// What kind of object a resource is. Reads always name tables; DDL can also target views,
+/// schemas and catalogs (`CREATE DATABASE` is reported as a catalog), and administrative
+/// statements name roles, functions/procedures, and session settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceKind {
+    #[default]
+    Table,
+    View,
+    Schema,
+    Catalog,
+    /// A session setting (`SET search_path = …`); `name` is the setting, `value` its new value.
+    Session,
+    Role,
+    Function,
+    Procedure,
+}
+
+impl ResourceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResourceKind::Table => "table",
+            ResourceKind::View => "view",
+            ResourceKind::Schema => "schema",
+            ResourceKind::Catalog => "catalog",
+            ResourceKind::Session => "session",
+            ResourceKind::Role => "role",
+            ResourceKind::Function => "function",
+            ResourceKind::Procedure => "procedure",
+        }
+    }
+}
+
+/// One object a statement touches: a table with its referenced columns, or — for DDL and
+/// administrative statements — a view, schema, catalog, role, function/procedure or session
+/// setting. For `Schema` the object is `catalog`.`schema` and `table` is empty; for `Catalog`
+/// only `catalog` is set; for every other kind `table` holds the object's own name.
 #[derive(Debug, Clone)]
 pub struct AccessResource {
+    pub kind: ResourceKind,
     pub catalog: Option<String>,
     pub schema: Option<String>,
     pub table: String,
     pub columns: Columns,
+    /// The value a `SET` assigns to a session setting. `None` for everything else.
+    pub value: Option<String>,
 }
 
 impl AccessResource {
-    /// `schema.table` (or bare `table`) — the key policy decisions and the rewrite match on.
+    /// The object's own name — the table/view name, the schema name, or the catalog name.
+    /// This is the key a policy's per-resource decision is matched back on.
+    pub fn name(&self) -> &str {
+        match self.kind {
+            ResourceKind::Schema => self.schema.as_deref().unwrap_or_default(),
+            ResourceKind::Catalog => self.catalog.as_deref().unwrap_or_default(),
+            _ => &self.table,
+        }
+    }
+
+    /// `schema.table` (or bare `table`) — the key policy decisions and the rewrite match on —
+    /// for every kind that carries a `catalog`/`schema`/`table` triple the way a table does
+    /// (table, view, session, role, function, procedure). `catalog.schema` (or bare `schema`)
+    /// for a schema, and the bare catalog name for a catalog — what audit/error messages
+    /// display for those DDL targets.
     pub fn qualified_name(&self) -> String {
-        match &self.schema {
-            Some(s) => format!("{s}.{}", self.table),
-            None => self.table.clone(),
+        match self.kind {
+            ResourceKind::Schema => match &self.catalog {
+                Some(c) => format!("{c}.{}", self.name()),
+                None => self.name().to_string(),
+            },
+            ResourceKind::Catalog => self.name().to_string(),
+            _ => match &self.schema {
+                Some(s) => format!("{s}.{}", self.table),
+                None => self.table.clone(),
+            },
         }
     }
 }
@@ -80,9 +183,20 @@ pub struct RequestContext {
     pub session_params: BTreeMap<String, String>,
 }
 
+/// What a `GRANT`/`REVOKE` hands out, beyond the object it is granted on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrantDetail {
+    pub privileges: Vec<String>,
+    pub grantees: Vec<String>,
+    /// `WITH GRANT OPTION` / `WITH ADMIN OPTION` (and, on `REVOKE`, `… OPTION FOR`).
+    pub with_grant_option: bool,
+}
+
 /// The full request to the policy engine.
 #[derive(Debug, Clone)]
 pub struct AccessRequest {
+    /// Set for `grant.*` and `role.grant`/`role.revoke` requests.
+    pub grant: Option<GrantDetail>,
     pub identity: Identity,
     pub operation: Operation,
     pub resources: Vec<AccessResource>,
@@ -242,6 +356,111 @@ mod tests {
             row_filters: Vec::new(),
             column_masks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn create_operations_have_a_drop_counterpart() {
+        for (create, drop) in [
+            ("table.create", "table.drop"),
+            ("view.create", "view.drop"),
+            ("schema.create", "schema.drop"),
+            ("catalog.create", "catalog.drop"),
+            ("role.create", "role.drop"),
+            ("function.create", "function.drop"),
+            ("procedure.create", "procedure.drop"),
+        ] {
+            assert_eq!(
+                Operation(create.to_string()).drop_counterpart(),
+                Some(Operation(drop.to_string()))
+            );
+            assert!(Operation::SUPPORTED.contains(&create) && Operation::SUPPORTED.contains(&drop));
+        }
+        assert_eq!(Operation::table_select().drop_counterpart(), None);
+        assert_eq!(Operation("table.drop".to_string()).drop_counterpart(), None);
+    }
+
+    #[test]
+    fn resource_name_is_the_kinds_own_leaf() {
+        let r = |kind, catalog: Option<&str>, schema: Option<&str>, table: &str| AccessResource {
+            kind,
+            catalog: catalog.map(String::from),
+            schema: schema.map(String::from),
+            table: table.to_string(),
+            columns: Columns::All,
+            value: None,
+        };
+        assert_eq!(
+            r(ResourceKind::Table, Some("c"), Some("s"), "orders").name(),
+            "orders"
+        );
+        assert_eq!(r(ResourceKind::View, None, Some("s"), "v").name(), "v");
+        assert_eq!(
+            r(ResourceKind::Schema, Some("c"), Some("analytics"), "").name(),
+            "analytics"
+        );
+        assert_eq!(
+            r(ResourceKind::Catalog, Some("prod"), None, "").name(),
+            "prod"
+        );
+        // Roles, functions, procedures and session settings are named by `table`.
+        for kind in [
+            ResourceKind::Role,
+            ResourceKind::Function,
+            ResourceKind::Procedure,
+            ResourceKind::Session,
+        ] {
+            assert_eq!(r(kind, None, Some("s"), "thing").name(), "thing");
+        }
+    }
+
+    /// A `Schema`/`Catalog` resource's `table` is empty, so `qualified_name` must build its
+    /// display name from `kind` instead of falling through to the table/view formatting
+    /// (which would otherwise render as a bare trailing dot or an empty string). Every other
+    /// kind (table, view, session, role, function, procedure) shares the same
+    /// `catalog`/`schema`/`table` triple `_entry` builds them with, so they all format the
+    /// same way.
+    #[test]
+    fn qualified_name_covers_every_kind() {
+        let r = |kind, catalog: Option<&str>, schema: Option<&str>, table: &str| AccessResource {
+            kind,
+            catalog: catalog.map(String::from),
+            schema: schema.map(String::from),
+            table: table.to_string(),
+            columns: Columns::All,
+            value: None,
+        };
+        assert_eq!(
+            r(ResourceKind::Table, None, Some("s"), "orders").qualified_name(),
+            "s.orders"
+        );
+        assert_eq!(
+            r(ResourceKind::Table, None, None, "orders").qualified_name(),
+            "orders"
+        );
+        assert_eq!(
+            r(ResourceKind::Schema, Some("prod"), Some("analytics"), "").qualified_name(),
+            "prod.analytics"
+        );
+        assert_eq!(
+            r(ResourceKind::Schema, None, Some("analytics"), "").qualified_name(),
+            "analytics"
+        );
+        assert_eq!(
+            r(ResourceKind::Catalog, Some("prod"), None, "").qualified_name(),
+            "prod"
+        );
+        assert_eq!(
+            r(ResourceKind::Role, None, None, "analyst").qualified_name(),
+            "analyst"
+        );
+        assert_eq!(
+            r(ResourceKind::Session, None, None, "search_path").qualified_name(),
+            "search_path"
+        );
+        assert_eq!(
+            r(ResourceKind::Procedure, None, Some("s"), "my_proc").qualified_name(),
+            "s.my_proc"
+        );
     }
 
     #[test]

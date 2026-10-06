@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use queryflux_core::access_model::{
-    AccessDecision, AccessRequest, AccessResource, ColumnMask, Columns, ResourceDecision, RowFilter,
+    AccessDecision, AccessRequest, AccessResource, ColumnMask, Columns, ResourceDecision,
+    ResourceKind, RowFilter,
 };
 
 // ---- request ----
@@ -36,15 +37,39 @@ pub(super) struct WireIdentity<'a> {
 pub(super) struct WireAction<'a> {
     pub operation: &'a str,
     pub resources: Vec<WireResource<'a>>,
+    /// What a `GRANT`/`REVOKE` hands out. Only present for `grant.*` and `role.grant/revoke`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant: Option<WireGrant<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WireGrant<'a> {
+    pub privileges: &'a [String],
+    pub grantees: &'a [String],
+    pub with_grant_option: bool,
+}
+
+fn is_empty_str(s: &&str) -> bool {
+    s.is_empty()
 }
 
 #[derive(Serialize)]
 pub(super) struct WireResource<'a> {
+    /// `table`, `view`, `schema` or `catalog` — reads are always tables; DDL can target the rest.
+    pub kind: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub catalog: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<&'a str>,
+    /// Only `table` and `view` resources have one; every other kind is identified by `name`.
+    #[serde(skip_serializing_if = "is_empty_str")]
     pub table: &'a str,
+    /// The value a `SET` assigns to a session setting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<&'a str>,
+    /// The object's own name (table/view, schema, or catalog) — echo it back in the response.
+    pub name: &'a str,
     /// `null` = all columns (schema unresolved / `SELECT *`).
     pub columns: Option<&'a [String]>,
 }
@@ -73,15 +98,27 @@ pub(super) fn to_request(req: &AccessRequest) -> OpaRequest<'_> {
                     .resources
                     .iter()
                     .map(|r| WireResource {
+                        kind: r.kind.as_str(),
                         catalog: r.catalog.as_deref(),
                         schema: r.schema.as_deref(),
-                        table: &r.table,
+                        table: if matches!(r.kind, ResourceKind::Table | ResourceKind::View) {
+                            &r.table
+                        } else {
+                            ""
+                        },
+                        value: r.value.as_deref(),
+                        name: r.name(),
                         columns: match &r.columns {
                             Columns::All => None,
                             Columns::Named(c) => Some(c.as_slice()),
                         },
                     })
                     .collect(),
+                grant: req.grant.as_ref().map(|g| WireGrant {
+                    privileges: &g.privileges,
+                    grantees: &g.grantees,
+                    with_grant_option: g.with_grant_option,
+                }),
             },
             context: WireContext {
                 cluster_group: &req.context.cluster_group,
@@ -110,7 +147,12 @@ pub(super) struct OpaResult {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct WireResourceDecision {
-    pub table: String,
+    /// Echo of the resource's `table` (table resources) or `name` (any kind); `name` wins if
+    /// both are present. Neither → the decision can't be matched and the resource is denied.
+    #[serde(default)]
+    pub table: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub allow: bool,
     #[serde(default)]
@@ -146,8 +188,23 @@ pub(super) fn from_response(resp: OpaResponse, requested: &AccessRequest) -> Acc
     };
 
     let mut bare_counts: HashMap<String, usize> = HashMap::new();
+    // A `name` echo is exact (no schema/catalog to reconstruct), but two *different*
+    // requested resources can still share the same bare name — two `orders` tables in
+    // different schemas, or two `analytics` schemas in different catalogs — so it needs the
+    // same ambiguity guard `bare_counts` gives the `table` echo, keyed by (kind, name)
+    // since a table and a schema can coincidentally share a leaf name too.
+    let mut name_counts: HashMap<(&'static str, String), usize> = HashMap::new();
     for res in &requested.resources {
-        *bare_counts.entry(res.table.to_lowercase()).or_insert(0) += 1;
+        // Schema/catalog resources have no `table` (it's `""`); an empty-string key would
+        // let two unrelated schema/catalog resources in one request falsely look "unique"
+        // (or ambiguous) to each other. They're matched by `name` instead (see
+        // `decision_covers`), so they never need a `bare_counts` entry at all.
+        if !res.table.is_empty() {
+            *bare_counts.entry(res.table.to_lowercase()).or_insert(0) += 1;
+        }
+        *name_counts
+            .entry((res.kind.as_str(), res.name().to_lowercase()))
+            .or_insert(0) += 1;
     }
 
     let resources = requested
@@ -157,7 +214,7 @@ pub(super) fn from_response(resp: OpaResponse, requested: &AccessRequest) -> Acc
             match result
                 .resources
                 .iter()
-                .find(|d| decision_covers(&d.table, res, &bare_counts))
+                .find(|d| decision_covers(d, res, &bare_counts, &name_counts))
             {
                 Some(d) => ResourceDecision {
                     table: res.qualified_name(),
@@ -182,17 +239,44 @@ pub(super) fn from_response(resp: OpaResponse, requested: &AccessRequest) -> Acc
     AccessDecision { resources }
 }
 
-/// Whether a decision's `table` key refers to `res`. Policies echo the input's bare `table`
-/// or build `schema.table` / `catalog.schema.table`; match case-insensitively, as the
-/// rewrite does. `bare_counts` maps a lowercased bare table name to how many resources in
-/// the *request* share it — a bare decision only resolves an unqualified `res`, or a
-/// qualified one when its bare name is unique in the request (see [`from_response`]).
+/// Whether a decision refers to `res`. A `name` echo (any kind) matches case-insensitively
+/// against [`AccessResource::name`] — but, just like the `table` echo below, only when that
+/// (kind, name) is unambiguous in the request: two different tables (or two schemas, two
+/// catalogs, …) can share a bare name, and a `name` echo doesn't carry enough to tell them
+/// apart either. Falling back to a `table` echo (table/view resources only — schema/catalog
+/// resources have no `table` to fall back to): policies commonly reply with the bare `table`
+/// from the input rather than round-tripping `schema`/`catalog`; comparing those bare
+/// strings directly downstream (e.g. when matching a row filter to a scan site) would let a
+/// decision meant for one schema's table apply to a same-named table in another schema. A
+/// bare reply is accepted only when that bare name is unambiguous — the *only* requested
+/// resource with that name — otherwise which schema it meant can't be known, and the
+/// resource is treated as undecided (denied) rather than guessed at. `bare_counts` and
+/// `name_counts` map a lowercased bare table name / (kind, name) pair to how many resources
+/// in the *request* share it (see [`from_response`]).
 fn decision_covers(
-    decision_table: &str,
+    decision: &WireResourceDecision,
     res: &AccessResource,
     bare_counts: &HashMap<String, usize>,
+    name_counts: &HashMap<(&'static str, String), usize>,
 ) -> bool {
-    let d = decision_table.to_lowercase();
+    if let Some(name) = decision.name.as_deref() {
+        if name.eq_ignore_ascii_case(res.name())
+            && name_counts
+                .get(&(res.kind.as_str(), res.name().to_lowercase()))
+                .copied()
+                == Some(1)
+        {
+            return true;
+        }
+    }
+    if res.table.is_empty() {
+        // A schema/catalog resource only ever matches by `name`, above.
+        return false;
+    }
+    let Some(table_echo) = decision.table.as_deref() else {
+        return false;
+    };
+    let d = table_echo.to_lowercase();
     let table = res.table.to_lowercase();
     let Some(schema) = res.schema.as_deref().map(str::to_lowercase) else {
         return d == table;
@@ -214,15 +298,20 @@ fn decision_covers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use queryflux_core::access_model::{AccessResource, Identity, Operation, RequestContext};
+    use queryflux_core::access_model::{
+        AccessResource, Identity, Operation, RequestContext, ResourceKind,
+    };
 
     fn requested(tables: &[&str]) -> AccessRequest {
         AccessRequest {
+            grant: None,
             identity: Identity::default(),
             operation: Operation::table_select(),
             resources: tables
                 .iter()
                 .map(|t| AccessResource {
+                    kind: ResourceKind::Table,
+                    value: None,
                     catalog: None,
                     schema: None,
                     table: t.to_string(),
@@ -248,6 +337,124 @@ mod tests {
         assert_eq!(decision.first_denied().map(|(t, _)| t), Some("customers"));
     }
 
+    fn schema_request(schema: &str) -> AccessRequest {
+        let mut req = requested(&[]);
+        req.operation = Operation("schema.drop".to_string());
+        req.resources = vec![AccessResource {
+            kind: ResourceKind::Schema,
+            value: None,
+            catalog: Some("prod".to_string()),
+            schema: Some(schema.to_string()),
+            table: String::new(),
+            columns: Columns::All,
+        }];
+        req
+    }
+
+    /// DDL targets go out with their `kind` and `name`; a schema has no `table`.
+    #[test]
+    fn schema_resource_is_sent_with_kind_and_name_and_no_table() {
+        let req = schema_request("analytics");
+        let json = serde_json::to_value(to_request(&req)).unwrap();
+        let r = &json["input"]["action"]["resources"][0];
+        assert_eq!(r["kind"], "schema");
+        assert_eq!(r["name"], "analytics");
+        assert_eq!(r["schema"], "analytics");
+        assert_eq!(r["catalog"], "prod");
+        assert!(r.get("table").is_none(), "{r}");
+        assert_eq!(json["input"]["action"]["operation"], "schema.drop");
+
+        let table = serde_json::to_value(to_request(&requested(&["orders"]))).unwrap();
+        let t = &table["input"]["action"]["resources"][0];
+        assert_eq!(
+            (t["kind"].as_str(), t["table"].as_str(), t["name"].as_str()),
+            (Some("table"), Some("orders"), Some("orders"))
+        );
+    }
+
+    /// Administrative resources are identified by `kind` + `name` (no `table`); a session
+    /// setting carries its `value`, and a grant its privileges and grantees.
+    #[test]
+    fn admin_resources_and_grant_detail_are_sent() {
+        use queryflux_core::access_model::GrantDetail;
+        let mut req = requested(&[]);
+        req.operation = Operation("grant.grant".to_string());
+        req.grant = Some(GrantDetail {
+            privileges: vec!["SELECT".to_string()],
+            grantees: vec!["alice".to_string()],
+            with_grant_option: true,
+        });
+        req.resources = vec![
+            AccessResource {
+                kind: ResourceKind::Role,
+                catalog: None,
+                schema: None,
+                table: "analyst".to_string(),
+                columns: Columns::All,
+                value: None,
+            },
+            AccessResource {
+                kind: ResourceKind::Session,
+                catalog: None,
+                schema: None,
+                table: "search_path".to_string(),
+                columns: Columns::All,
+                value: Some("analytics".to_string()),
+            },
+        ];
+        let json = serde_json::to_value(to_request(&req)).unwrap();
+        let a = &json["input"]["action"];
+        assert_eq!(a["grant"]["privileges"], serde_json::json!(["SELECT"]));
+        assert_eq!(a["grant"]["grantees"], serde_json::json!(["alice"]));
+        assert_eq!(a["grant"]["withGrantOption"], true);
+        let (role, session) = (&a["resources"][0], &a["resources"][1]);
+        assert_eq!(
+            (role["kind"].as_str(), role["name"].as_str()),
+            (Some("role"), Some("analyst"))
+        );
+        assert!(
+            role.get("table").is_none() && role.get("value").is_none(),
+            "{role}"
+        );
+        assert_eq!(
+            (session["kind"].as_str(), session["value"].as_str()),
+            (Some("session"), Some("analytics"))
+        );
+
+        // A plain read carries neither.
+        let plain = serde_json::to_value(to_request(&requested(&["orders"]))).unwrap();
+        assert!(plain["input"]["action"].get("grant").is_none());
+    }
+
+    /// A policy may echo `name` (any kind) or `table` (table resources); `name` wins.
+    #[test]
+    fn response_is_matched_on_name_or_table() {
+        let by_name: OpaResponse = serde_json::from_str(
+            r#"{"result": {"resources": [{"name": "analytics", "allow": true}]}}"#,
+        )
+        .unwrap();
+        assert!(from_response(by_name, &schema_request("analytics")).is_allowed());
+
+        let by_table: OpaResponse = serde_json::from_str(
+            r#"{"result": {"resources": [{"table": "orders", "allow": true}]}}"#,
+        )
+        .unwrap();
+        assert!(from_response(by_table, &requested(&["orders"])).is_allowed());
+
+        let both: OpaResponse = serde_json::from_str(
+            r#"{"result": {"resources": [{"table": "x", "name": "analytics", "allow": true}]}}"#,
+        )
+        .unwrap();
+        assert!(from_response(both, &schema_request("analytics")).is_allowed());
+
+        // An echo that matches nothing is a missing decision, not an implicit allow.
+        let wrong: OpaResponse = serde_json::from_str(
+            r#"{"result": {"resources": [{"name": "other", "allow": true}]}}"#,
+        )
+        .unwrap();
+        assert!(!from_response(wrong, &schema_request("analytics")).is_allowed());
+    }
+
     #[test]
     fn fully_decided_response_is_allowed() {
         let resp: OpaResponse = serde_json::from_str(
@@ -267,15 +474,18 @@ mod tests {
 
     fn request(tables: &[(&str, &str)]) -> AccessRequest {
         AccessRequest {
+            grant: None,
             identity: Identity::default(),
             operation: Operation::table_select(),
             resources: tables
                 .iter()
                 .map(|(s, t)| AccessResource {
+                    kind: ResourceKind::Table,
                     catalog: None,
                     schema: Some((*s).into()),
                     table: (*t).into(),
                     columns: Columns::All,
+                    value: None,
                 })
                 .collect(),
             context: RequestContext::default(),
@@ -288,7 +498,8 @@ mod tests {
                 resources: entries
                     .iter()
                     .map(|(t, allow)| WireResourceDecision {
-                        table: (*t).into(),
+                        table: Some((*t).into()),
+                        name: None,
                         allow: *allow,
                         reason: None,
                         row_filters: Vec::new(),
@@ -358,6 +569,47 @@ mod tests {
             assert!(
                 !r.allow,
                 "{r:?} must not be allowed by the ambiguous bare decision"
+            );
+        }
+    }
+
+    /// Same regression as `ambiguous_bare_decision_does_not_cover_either_same_named_table`,
+    /// but for a `name` echo: two schema resources in different catalogs share the bare
+    /// name `analytics`, so a single `{"name": "analytics", ...}` decision must not resolve
+    /// to either of them.
+    #[test]
+    fn ambiguous_name_decision_does_not_cover_either_same_named_schema() {
+        let mut req = requested(&[]);
+        req.operation = Operation("schema.drop".to_string());
+        req.resources = vec![
+            AccessResource {
+                kind: ResourceKind::Schema,
+                catalog: Some("prod".to_string()),
+                schema: Some("analytics".to_string()),
+                table: String::new(),
+                columns: Columns::All,
+                value: None,
+            },
+            AccessResource {
+                kind: ResourceKind::Schema,
+                catalog: Some("staging".to_string()),
+                schema: Some("analytics".to_string()),
+                table: String::new(),
+                columns: Columns::All,
+                value: None,
+            },
+        ];
+        let resp: OpaResponse = serde_json::from_str(
+            r#"{"result": {"resources": [{"name": "analytics", "allow": true}]}}"#,
+        )
+        .unwrap();
+        let d = from_response(resp, &req);
+        assert!(!d.is_allowed());
+        assert_eq!(d.resources.len(), 2);
+        for r in &d.resources {
+            assert!(
+                !r.allow,
+                "{r:?} must not be allowed by the ambiguous name decision"
             );
         }
     }

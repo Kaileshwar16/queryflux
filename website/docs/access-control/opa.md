@@ -6,7 +6,15 @@ image: img/queryflux-hero-banner.png
 ---
 # OPA provider
 
-[Open Policy Agent](https://www.openpolicyagent.org/) (OPA) is the access-control provider shipped with QueryFlux. Grants live in a Rego policy bundle you author and version outside QueryFlux; QueryFlux asks OPA on each query and enforces allow, deny, row filters, and column masks.
+<p class="provider-doc-hero">
+  <img src="/img/logos/opa.svg" alt="Open Policy Agent" class="provider-logo provider-logo--lg" />
+  <span>
+    <a href="https://www.openpolicyagent.org/">Open Policy Agent</a> (OPA) is the access-control
+    provider shipped with QueryFlux. Grants live in a Rego policy bundle you author and version
+    outside QueryFlux; QueryFlux asks OPA on each query and enforces allow, deny, row filters, and
+    column masks.
+  </span>
+</p>
 
 Read the [Access control overview](overview.md) first for the pipeline, identity model, and provider-agnostic config. This page covers the OPA wire contract, Rego shape, server auth, and the runnable demo.
 
@@ -71,7 +79,7 @@ No connection name is reserved. `provider: opa` without an `opa:` block on a con
 
 Scope — which **cluster groups** run access control, and which named connection each uses — is configured under `accessControl.groups` and edited on the **Access Control** page in Studio (not on the Clusters group form). See [Scope by cluster group](overview.md#scope-by-cluster-group) and [Multiple connections](overview.md#multiple-connections).
 
-Different rules per team on the **same** OPA: branch in Rego on `input.context.clusterGroup` and `input.identity.groups` — that's the common case, and it's one bundle to `opa test`. A genuinely different **OPA server** per team (network segmentation, blast-radius isolation, migrating one group to a new provider) is a second named `connections` entry plus `groups.<name>.connection`, not a separate QueryFlux instance.
+Different rules per team on the **same** OPA: branch in Rego on `input.context.clusterGroup` and `input.identity.groups` — that's the common case, and it's one bundle to `opa test`. A genuinely different **OPA server** per team (network segmentation, blast-radius isolation, migrating one group to a new OPA deployment) is a second named `connections` entry plus `groups.<name>.connection`, not a separate QueryFlux instance.
 
 ---
 
@@ -99,9 +107,11 @@ Content-Type: application/json
       "operation": "table.select",
       "resources": [
         {
+          "kind": "table",
           "catalog": "lakekeeper",
           "schema": "demo",
           "table": "customers",
+          "name": "customers",
           "columns": ["name", "region", "ssn"]
         }
       ]
@@ -121,8 +131,12 @@ Content-Type: application/json
 | Field | Notes |
 | --- | --- |
 | `identity.*` | Verified `AuthContext` only. |
-| `action.operation` | e.g. `table.select`. |
-| `action.resources[].table` | Bare or as QueryFlux extracted it; often schema-qualified in practice. |
+| `action.operation` | `table.select` for tables the statement reads; for a write or DDL target, its own operation (`table.insert`/`update`/`delete`/`merge`/`truncate`/`create`/`drop`/`alter`, `view.create`/`drop`/`alter`, `schema.create`/`drop`, `catalog.create`/`drop`) when enabled in `operations`. A statement with both reads and a target makes one request for each; `CREATE OR REPLACE` also makes the matching `*.drop` request. |
+| `action.resources[].kind` | `table` for everything a query reads; other statements can target a `view`, `schema`, `catalog` (`CREATE DATABASE` is reported as a catalog), `role`, `function`, `procedure` or `session` setting. |
+| `action.resources[].value` | Only for `session` resources: the value a `SET` assigns. |
+| `action.grant` | Only for `grant.grant`/`grant.revoke` and `role.grant`/`role.revoke`: `{privileges, grantees, withGrantOption}`. |
+| `action.resources[].name` | The object's own name — table/view, schema, or catalog. Present for every kind. |
+| `action.resources[].table` | Bare or as QueryFlux extracted it; often schema-qualified in practice. **Omitted** for every kind except `table` and `view` (use `name`; a schema is `schema`, a catalog is `catalog`). |
 | `action.resources[].columns` | Named list, or **omitted / null** meaning all columns (`SELECT *` or unresolved schema). |
 | `context.sessionParams` | Only keys listed in `sessionParamKeys`. |
 
@@ -151,7 +165,7 @@ OPA must return a `result` object with a non-empty `resources` array. A missing 
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `table` | yes | Echo the resource table key the rewrite matcher uses. |
+| `table` / `name` | yes (one of them) | Echo the resource's `table` (table resources) or `name` (any kind) — QueryFlux matches decisions back on it. `name` wins if both are sent. An echo that matches no requested resource counts as a missing decision, which denies. |
 | `allow` | yes | `false` denies the whole query if any resource is denied. |
 | `reason` | no | Surfaced on deny / audit. |
 | `rowFilters` | no | Each entry needs `expression` (source-dialect boolean SQL). |
@@ -360,7 +374,7 @@ Set `failOpen: true` (or per-group) only when availability must trump enforcemen
 
 ## Local demo
 
-A Compose stack with Lakekeeper, MinIO, Trino, OPA, and a small UI lives under [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa):
+A Compose stack with Lakekeeper, RustFS, Trino, OPA, and a small UI lives under [`examples/with-opa/`](https://github.com/lakeops-org/queryflux/tree/main/examples/with-opa):
 
 | User | Groups | `customers` | `payroll` |
 | --- | --- | --- | --- |

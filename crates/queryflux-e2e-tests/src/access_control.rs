@@ -66,9 +66,47 @@ pub struct StubState {
     pub empty_result: bool,
     /// Full per-user override: `user → table → verdict`. Wins over the maps above.
     pub by_user: HashMap<String, HashMap<String, TableVerdict>>,
+    /// Every `input` body the stub has received, in order.
+    pub requests: Vec<Value>,
+    /// `(operation, table) → filter`, returned for that operation only and taking
+    /// precedence over [`Self::row_filters`] — lets a test give reads and writes of the same
+    /// table different filters.
+    pub op_row_filters: HashMap<(String, String), String>,
+    /// `(operation, name)` pairs denied for that operation only — lets a test allow a
+    /// `CREATE` but deny the `DROP` a `CREATE OR REPLACE` also needs.
+    pub op_denied: HashSet<(String, String)>,
 }
 
 impl StubState {
+    pub fn deny_for(&mut self, operation: impl Into<String>, name: impl Into<String>) {
+        self.op_denied.insert((operation.into(), name.into()));
+    }
+
+    pub fn filter_for(
+        &mut self,
+        operation: impl Into<String>,
+        table: impl Into<String>,
+        expr: impl Into<String>,
+    ) {
+        self.op_row_filters
+            .insert((operation.into(), table.into()), expr.into());
+    }
+
+    /// Drop every filter so a test can read the table's real contents.
+    pub fn clear_filters(&mut self) {
+        self.row_filters.clear();
+        self.op_row_filters.clear();
+    }
+
+    /// The recorded `input.action` objects whose `operation` is `op`.
+    pub fn actions_for(&self, op: &str) -> Vec<Value> {
+        self.requests
+            .iter()
+            .map(|r| r["input"]["action"].clone())
+            .filter(|a| a["operation"] == op)
+            .collect()
+    }
+
     pub fn deny(&mut self, table: impl Into<String>) {
         self.deny_tables.insert(table.into());
     }
@@ -133,13 +171,23 @@ async fn opa_handler(
         .as_str()
         .unwrap_or("")
         .to_string();
-    let st = state.lock().unwrap();
+    let mut st = state.lock().unwrap();
+    st.requests.push(body.clone());
     if st.empty_result {
         return Json(json!({ "result": {} }));
     }
     let mut out = Vec::new();
+    let operation = body["input"]["action"]["operation"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     for r in resources {
-        let table = r["table"].as_str().unwrap_or("").to_string();
+        // `name` is the object's own name for every kind (a schema has no `table`).
+        let table = r["name"]
+            .as_str()
+            .or_else(|| r["table"].as_str())
+            .unwrap_or("")
+            .to_string();
         if let Some(verdict) = st
             .by_user
             .get(&user)
@@ -149,13 +197,17 @@ async fn opa_handler(
             continue;
         }
 
-        let mut entry = json!({ "table": table, "allow": true });
-        if contains_table(&st.deny_tables, &table) {
+        let mut entry = json!({ "table": table, "name": table, "allow": true });
+        if contains_table(&st.deny_tables, &table)
+            || st.op_denied.contains(&(operation.clone(), table.clone()))
+        {
             entry["allow"] = json!(false);
             entry["reason"] = json!("denied by stub policy");
         } else {
             let mut filters: Vec<Value> = Vec::new();
-            if let Some(expr) = lookup_map(&st.row_filters, &table) {
+            if let Some(expr) = st.op_row_filters.get(&(operation.clone(), table.clone())) {
+                filters.push(json!({ "expression": expr }));
+            } else if let Some(expr) = lookup_map(&st.row_filters, &table) {
                 filters.push(json!({ "expression": expr }));
             }
             if let Some(extra) = lookup_map(&st.extra_row_filters, &table) {
@@ -180,7 +232,7 @@ async fn opa_handler(
 }
 
 fn verdict_json(table: &str, v: &TableVerdict) -> Value {
-    let mut entry = json!({ "table": table, "allow": v.allow });
+    let mut entry = json!({ "table": table, "name": table, "allow": v.allow });
     if let Some(reason) = &v.reason {
         entry["reason"] = json!(reason);
     }
@@ -239,6 +291,17 @@ impl Default for GuardOpts {
 /// Build a real `OpaAccessGuard` pointed at the stub, evaluating every SELECT.
 pub fn build_guard(opa_url: &str) -> Arc<OpaAccessGuard> {
     build_guard_with(opa_url, GuardOpts::default())
+}
+
+/// Like [`build_guard`], evaluating exactly the given namespaced operations.
+pub fn build_guard_with_operations(opa_url: &str, operations: &[&str]) -> Arc<OpaAccessGuard> {
+    build_guard_with(
+        opa_url,
+        GuardOpts {
+            operations: operations.iter().map(|o| o.to_string()).collect(),
+            ..GuardOpts::default()
+        },
+    )
 }
 
 pub fn build_guard_with(opa_url: &str, opts: GuardOpts) -> Arc<OpaAccessGuard> {
