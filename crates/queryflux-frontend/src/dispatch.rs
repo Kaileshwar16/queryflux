@@ -3332,6 +3332,7 @@ mod translation_policy_tests {
                         FrontendProtocol::PostgresWire,
                         ClusterGroupName("default".into()),
                         &auth,
+                        &[],
                     )
                     .await
                     .err()
@@ -3414,6 +3415,7 @@ mod translation_policy_tests {
                 protocol.clone(),
                 ClusterGroupName("default".into()),
                 &AuthContext::default(),
+                &[],
             )
             .await
             .expect("access-controlled execution setup");
@@ -3656,6 +3658,7 @@ mod translation_policy_tests {
                     FrontendProtocol::PostgresWire,
                     ClusterGroupName("default".into()),
                     &auth,
+                    &[],
                 )
                 .await
                 .err()
@@ -3708,6 +3711,7 @@ mod translation_policy_tests {
                 FrontendProtocol::TrinoHttp,
                 ClusterGroupName("default".into()),
                 &auth,
+                &[],
             )
             .await
             .expect("compatible request after strict rejection");
@@ -3742,6 +3746,7 @@ mod translation_policy_tests {
                 protocol,
                 ClusterGroupName("default".into()),
                 &AuthContext::default(),
+                &[],
             )
             .await
             .expect("execution setup should succeed");
