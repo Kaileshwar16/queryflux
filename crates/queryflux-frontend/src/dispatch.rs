@@ -8,7 +8,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
 use queryflux_auth::{AuthContext, QueryCredentials};
-use queryflux_cluster_manager::ClusterGroupManager;
+use queryflux_cluster_manager::{circuit_breaker::BackendOutcome, ClusterGroupManager};
 use queryflux_core::native_result::NativeResultChunk;
 use queryflux_core::params::{interpolate_params, QueryParams};
 use queryflux_core::tags::{merge_tags, QueryTags};
@@ -93,6 +93,60 @@ fn should_resolve_schema(attempt_translation: bool, access_control_enabled: bool
 
 fn should_attempt_translation(session: &SessionContext, protocol: &FrontendProtocol) -> bool {
     !matches!(protocol, FrontendProtocol::Mcp) || session.extra.contains_key("dialect")
+}
+
+/// Only connection/availability failures and execution deadlines count against
+/// a cluster. A SQL error means the backend answered and must not open its circuit.
+pub(crate) fn backend_error_outcome(error: &QueryFluxError) -> BackendOutcome {
+    match error {
+        QueryFluxError::BackendFailure(_) => BackendOutcome::Failure,
+        QueryFluxError::BackendTimeout(_) => BackendOutcome::Timeout,
+        _ => BackendOutcome::Success,
+    }
+}
+
+#[cfg(test)]
+mod circuit_breaker_tests {
+    use super::*;
+
+    #[test]
+    fn typed_backend_outcomes_do_not_depend_on_message_text() {
+        for message in [
+            "connection refused",
+            "syntax error near timeout",
+            "Athena query failed: access denied",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::backend_failure(message)),
+                BackendOutcome::Failure,
+                "{message}"
+            );
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::backend_timeout(message)),
+                BackendOutcome::Timeout,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn untagged_engine_and_caller_errors_do_not_trip_breaker() {
+        for message in [
+            "syntax error near connection refused",
+            "mysql_native: connection failed: Access denied",
+            "ADBC: failed to create scoped database: invalid credentials",
+        ] {
+            assert_eq!(
+                backend_error_outcome(&QueryFluxError::Engine(message.into())),
+                BackendOutcome::Success,
+                "{message}"
+            );
+        }
+        assert_eq!(
+            backend_error_outcome(&QueryFluxError::Unauthorized("denied".into())),
+            BackendOutcome::Success
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -752,8 +806,12 @@ pub async fn dispatch_query(
                 )
                 .await
             {
-                Ok(e) => e,
+                Ok(e) => {
+                    slot.record_backend_outcome(BackendOutcome::Success);
+                    e
+                }
                 Err(e) => {
+                    slot.record_backend_outcome(backend_error_outcome(&e));
                     slot.release().await;
                     warn!(id = %query_id, "Submit error: {e}");
                     return Err(e);
@@ -1007,7 +1065,7 @@ async fn should_yield_to_older_queued(
     let free = match cluster_manager.all_cluster_states().await {
         Ok(snaps) => snaps
             .iter()
-            .filter(|s| s.group_name.0 == group.0 && s.enabled && s.is_healthy)
+            .filter(|s| s.group_name.0 == group.0 && s.can_accept_query)
             .map(|s| s.max_running_queries.saturating_sub(s.running_queries))
             .sum::<u64>(),
         // Can't tell — don't block admission on a read failure.
@@ -1183,6 +1241,11 @@ impl ClusterSlotGuard {
     /// paths (poll, cancel, zombie eviction) become responsible for the release.
     fn disarm(&mut self) {
         self.released = true;
+    }
+
+    fn record_backend_outcome(&self, outcome: BackendOutcome) {
+        self.cluster_manager
+            .record_backend_outcome(&self.group, &self.cluster, outcome);
     }
 
     /// Release the slot on the normal path. Idempotent — safe to call twice.
@@ -1985,6 +2048,7 @@ async fn execute_stream(
     {
         Ok(e) => e,
         Err(e) => {
+            setup.slot.record_backend_outcome(backend_error_outcome(&e));
             let msg = e.to_string();
             warn!(
                 id = %setup.ctx.query_id,
@@ -2017,6 +2081,7 @@ async fn execute_stream(
     while let Some(result) = stream.next().await {
         match result {
             Err(e) => {
+                setup.slot.record_backend_outcome(backend_error_outcome(&e));
                 let msg = e.to_string();
                 let outcome = SyncOutcome {
                     status: QueryStatus::Failed,
@@ -2083,6 +2148,8 @@ async fn execute_stream(
         engine_stats,
     };
 
+    setup.slot.record_backend_outcome(BackendOutcome::Success);
+
     (outcome, sink.on_complete(&stats).await)
 }
 
@@ -2132,6 +2199,7 @@ async fn execute_native_to_sink(
     {
         Ok(e) => e,
         Err(e) => {
+            setup.slot.record_backend_outcome(backend_error_outcome(&e));
             let msg = e.to_string();
             warn!(
                 id = %setup.ctx.query_id,
@@ -2156,6 +2224,7 @@ async fn execute_native_to_sink(
     while let Some(result) = stream.next().await {
         match result {
             Err(e) => {
+                setup.slot.record_backend_outcome(backend_error_outcome(&e));
                 let msg = e.to_string();
                 let outcome = SyncOutcome {
                     status: QueryStatus::Failed,
@@ -2199,6 +2268,8 @@ async fn execute_native_to_sink(
         elapsed_ms,
         engine_stats,
     };
+
+    setup.slot.record_backend_outcome(BackendOutcome::Success);
 
     (outcome, sink.on_complete(&stats).await)
 }
